@@ -32,6 +32,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -84,16 +85,26 @@ class BootstrapConfig:
 
     # Patterns à exclure
     exclude_patterns: list[str] = field(default_factory=lambda: [
-        "build/**", "dist/**", "out/**", "target/**",
-        "*.o", "*.obj", "*.exe", "*.dll", "*.so", "*.a",
+        # Build outputs
+        "build/**", "buildLinux/**", "buildWindows/**", "buildMac/**",
+        "dist/**", "out/**", "target/**", "artifacts/**",
+        "*.o", "*.obj", "*.exe", "*.dll", "*.so", "*.a", "*.lib",
+        # Dependencies
+        "third_party/**", "external/**", "deps/**",
         "vendor/**", "node_modules/**", ".venv/**", "venv/**",
+        # Caches
+        ".cache/**", ".direnv/**", ".ccache/**",
         "__pycache__/**", "*.pyc", "*.egg-info/**",
+        ".pytest_cache/**", "coverage/**", ".coverage",
+        # IDE/VCS
         ".git/**", ".svn/**", ".idea/**", ".vscode/**",
         "*.swp", "*~",
+        # Generated/minified
         "**/*.min.js", "**/*.min.css", "**/*.generated.*",
         "**/generated/**",
-        ".claude/agentdb/**",
-        "coverage/**", ".coverage", ".pytest_cache/**",
+        # Project specific
+        ".claude/agentdb/**", ".claude/logs/**",
+        "assets/**", "logs/**",
     ])
 
     # Chemins critiques
@@ -311,14 +322,41 @@ def step_2_init_schema(config: BootstrapConfig, logger: logging.Logger) -> bool:
 
 def should_exclude(path: str, patterns: list[str]) -> bool:
     """Vérifie si un chemin doit être exclu."""
+    path_parts = path.split("/")
+
     for pattern in patterns:
-        if fnmatch.fnmatch(path, pattern):
-            return True
-        # Support des patterns avec **
-        if "**" in pattern:
-            regex = pattern.replace("**", ".*").replace("*", "[^/]*")
-            if re.match(regex, path):
+        # Pattern simple sans ** : utiliser fnmatch
+        if "**" not in pattern:
+            if fnmatch.fnmatch(path, pattern):
                 return True
+            # Vérifier aussi le nom de fichier seul
+            if fnmatch.fnmatch(path_parts[-1], pattern):
+                return True
+            continue
+
+        # Pattern "dir/**" : exclure tout le dossier
+        if pattern.endswith("/**"):
+            prefix = pattern[:-3]
+            if path.startswith(prefix + "/") or path == prefix:
+                return True
+            continue
+
+        # Pattern "**/suffix" : vérifier la fin du chemin
+        if pattern.startswith("**/"):
+            suffix = pattern[3:]
+            if fnmatch.fnmatch(path, suffix) or path.endswith("/" + suffix):
+                return True
+            # Vérifier chaque composant du chemin
+            for i, part in enumerate(path_parts):
+                subpath = "/".join(path_parts[i:])
+                if fnmatch.fnmatch(subpath, suffix):
+                    return True
+            continue
+
+        # Pattern complexe avec ** au milieu
+        if fnmatch.fnmatch(path, pattern.replace("**", "*")):
+            return True
+
     return False
 
 
@@ -527,7 +565,10 @@ def parse_python_file(file_path: Path) -> list[dict[str, Any]]:
 
     try:
         content = file_path.read_text(encoding="utf-8")
-        tree = ast.parse(content)
+        # Supprime les SyntaxWarning pour les escape sequences invalides
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=SyntaxWarning)
+            tree = ast.parse(content)
 
         symbols = []
 
@@ -722,7 +763,9 @@ def calculate_complexity(file_path: Path, language: str) -> dict[str, Any]:
         if language == "python":
             import ast
             try:
-                tree = ast.parse(content)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=SyntaxWarning)
+                    tree = ast.parse(content)
                 for node in ast.walk(tree):
                     if isinstance(node, ast.FunctionDef):
                         func_content = ast.unparse(node)
@@ -927,14 +970,34 @@ def step_6_analyze_git(
 
 def matches_pattern(path: str, patterns: list[str]) -> bool:
     """Vérifie si un chemin correspond à un des patterns."""
+    path_parts = path.split("/")
+
     for pattern in patterns:
-        if fnmatch.fnmatch(path, pattern):
-            return True
-        # Support **
-        if "**" in pattern:
-            regex = pattern.replace("**", ".*").replace("*", "[^/]*")
-            if re.match(regex, path):
+        if "**" not in pattern:
+            if fnmatch.fnmatch(path, pattern):
                 return True
+            continue
+
+        # Pattern "**/suffix"
+        if pattern.startswith("**/"):
+            suffix = pattern[3:]
+            for i in range(len(path_parts)):
+                subpath = "/".join(path_parts[i:])
+                if fnmatch.fnmatch(subpath, suffix):
+                    return True
+            continue
+
+        # Pattern "prefix/**"
+        if pattern.endswith("/**"):
+            prefix = pattern[:-3]
+            if path.startswith(prefix + "/") or path == prefix:
+                return True
+            continue
+
+        # Pattern complexe
+        if fnmatch.fnmatch(path, pattern.replace("**", "*")):
+            return True
+
     return False
 
 
