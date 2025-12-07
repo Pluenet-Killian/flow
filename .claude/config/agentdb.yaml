@@ -1,0 +1,202 @@
+# =============================================================================
+# AGENTDB CONFIGURATION
+# =============================================================================
+# Ce fichier configure le comportement d'AgentDB pour ce projet.
+# Modifiez-le selon les spécificités de votre codebase.
+
+# -----------------------------------------------------------------------------
+# PROJECT INFO
+# -----------------------------------------------------------------------------
+project:
+  name: "MonProjet"
+  language: "c"  # Langage principal: c, cpp, python, javascript
+  root: "."
+
+# -----------------------------------------------------------------------------
+# INDEXING CONFIGURATION
+# -----------------------------------------------------------------------------
+indexing:
+  # Extensions de fichiers à indexer, groupées par langage
+  extensions:
+    c:
+      - ".c"
+      - ".h"
+    cpp:
+      - ".cpp"
+      - ".hpp"
+      - ".cc"
+      - ".hh"
+      - ".cxx"
+      - ".hxx"
+    python:
+      - ".py"
+    javascript:
+      - ".js"
+      - ".jsx"
+      - ".ts"
+      - ".tsx"
+
+  # Patterns glob à exclure de l'indexation
+  exclude:
+    - "build/**"
+    - "dist/**"
+    - "vendor/**"
+    - "node_modules/**"
+    - "**/*.min.js"
+    - "**/*.generated.*"
+    - ".git/**"
+    - ".claude/agentdb/**"
+    - "**/__pycache__/**"
+    - "**/*.pyc"
+    - "**/venv/**"
+    - "**/.venv/**"
+
+  # Outil d'indexation par langage
+  # Options: ctags, tree-sitter, clang (C/C++), ast (Python)
+  tools:
+    c: "ctags"
+    cpp: "ctags"
+    python: "ast"
+    javascript: "tree-sitter"
+
+  # Taille maximale d'un fichier à indexer (en bytes)
+  # Les fichiers plus grands seront ignorés
+  max_file_size: 1048576  # 1 MB
+
+# -----------------------------------------------------------------------------
+# CRITICALITY CONFIGURATION
+# -----------------------------------------------------------------------------
+criticality:
+  # Chemins considérés comme critiques (sécurité, core, etc.)
+  # Le code dans ces chemins recevra un examen plus approfondi
+  critical_paths:
+    - "src/security/**"
+    - "src/auth/**"
+    - "src/crypto/**"
+    - "**/password*"
+    - "**/secret*"
+    - "**/token*"
+    - "**/credential*"
+
+  # Chemins de haute importance (moins critique mais important)
+  high_importance_paths:
+    - "src/core/**"
+    - "src/api/**"
+    - "src/main.*"
+    - "**/init.*"
+
+  # Patterns de contenu indiquant un code sensible
+  # Si un fichier contient ces patterns, il sera marqué security_sensitive
+  sensitive_content_patterns:
+    - "AES"
+    - "RSA"
+    - "SHA256"
+    - "bcrypt"
+    - "password"
+    - "secret"
+    - "private_key"
+    - "api_key"
+
+# -----------------------------------------------------------------------------
+# METRICS CONFIGURATION
+# -----------------------------------------------------------------------------
+metrics:
+  # Seuils de complexité cyclomatique
+  complexity:
+    # Au-dessus de ce seuil = warning
+    warning: 10
+    # Au-dessus de ce seuil = error
+    error: 20
+
+  # Seuils de documentation
+  documentation:
+    # Score minimum acceptable (0-100)
+    minimum_score: 50
+
+  # Seuils de profondeur d'imbrication
+  nesting:
+    warning: 4
+    error: 6
+
+  # Longueur maximale d'une fonction (lignes)
+  function_length:
+    warning: 50
+    error: 100
+
+# -----------------------------------------------------------------------------
+# GIT ANALYSIS CONFIGURATION
+# -----------------------------------------------------------------------------
+git:
+  # Périodes d'analyse de l'activité (en jours)
+  activity_periods:
+    - 30
+    - 90
+    - 365
+
+  # Nombre minimum de commits pour considérer un fichier "actif"
+  active_threshold: 3
+
+  # Ignorer les commits de merge pour le comptage
+  ignore_merge_commits: true
+
+# -----------------------------------------------------------------------------
+# PATTERNS CONFIGURATION
+# -----------------------------------------------------------------------------
+patterns:
+  # Activer/désactiver les catégories de patterns
+  enabled_categories:
+    - "error_handling"
+    - "memory_safety"
+    - "naming_convention"
+    - "documentation"
+    - "security"
+    - "performance"
+
+  # Sévérité par défaut pour les nouveaux patterns
+  default_severity: "warning"
+
+# -----------------------------------------------------------------------------
+# MCP SERVER CONFIGURATION
+# -----------------------------------------------------------------------------
+mcp:
+  # Port du serveur (si mode TCP, sinon stdio)
+  # port: 8765
+
+  # Niveau de log: DEBUG, INFO, WARNING, ERROR
+  log_level: "INFO"
+
+  # Timeout des requêtes en secondes
+  request_timeout: 30
+
+  # Cache des résultats (en secondes, 0 = désactivé)
+  cache_ttl: 60
+
+# -----------------------------------------------------------------------------
+# MAINTENANCE CONFIGURATION
+# -----------------------------------------------------------------------------
+maintenance:
+  # Nombre de jours après lesquels supprimer les snapshots
+  snapshot_retention_days: 30
+
+  # Nombre de runs de pipeline à garder en détail
+  keep_detailed_runs: 100
+
+  # Exécuter VACUUM automatiquement après N suppressions
+  auto_vacuum_threshold: 1000
+
+# -----------------------------------------------------------------------------
+# LOGGING CONFIGURATION
+# -----------------------------------------------------------------------------
+logging:
+  # Répertoire des logs
+  directory: ".claude/logs"
+
+  # Niveau de log: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+
+  # Format du log
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+  # Rotation des logs
+  max_size_mb: 10
+  backup_count: 5
