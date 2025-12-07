@@ -39,7 +39,17 @@ from .crud import (
     PipelineRunRepository,
     PatternRepository,
 )
-from .queries import GraphQueries, HistoryQueries, KnowledgeQueries
+from .queries import (
+    get_symbol_callers,
+    get_symbol_callees,
+    get_file_impact,
+    get_type_users,
+    get_include_tree,
+    get_symbol_by_name_qualified,
+    get_symbol_callers_by_name,
+    get_symbol_callees_by_name,
+    get_type_users_by_name,
+)
 from .indexer import CodeIndexer
 
 __all__ = [
@@ -62,10 +72,16 @@ __all__ = [
     "ErrorHistoryRepository",
     "PipelineRunRepository",
     "PatternRepository",
-    # Queries
-    "GraphQueries",
-    "HistoryQueries",
-    "KnowledgeQueries",
+    # Query functions
+    "get_symbol_callers",
+    "get_symbol_callees",
+    "get_file_impact",
+    "get_type_users",
+    "get_include_tree",
+    "get_symbol_by_name_qualified",
+    "get_symbol_callers_by_name",
+    "get_symbol_callees_by_name",
+    "get_type_users_by_name",
     # Indexer
     "CodeIndexer",
 ]
