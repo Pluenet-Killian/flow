@@ -560,51 +560,145 @@ def run_ctags(file_path: Path) -> list[dict[str, Any]]:
 
 
 def parse_python_file(file_path: Path) -> list[dict[str, Any]]:
-    """Parse un fichier Python avec ast."""
+    """
+    Parse un fichier Python avec ast.
+
+    Extrait :
+    - Fonctions de niveau module
+    - Classes avec bases d'héritage
+    - Méthodes dans les classes
+    - Visibilité (public/protected/private)
+    - Complexité cyclomatique
+    """
     import ast
+
+    def get_visibility(name: str) -> str:
+        """Détermine la visibilité selon les conventions Python."""
+        if name.startswith("__") and not name.endswith("__"):
+            return "private"
+        elif name.startswith("_"):
+            return "protected"
+        return "public"
+
+    def has_decorator(decorators: list, name: str) -> bool:
+        """Vérifie si un décorateur est présent."""
+        for d in decorators:
+            if isinstance(d, ast.Name) and d.id == name:
+                return True
+            elif isinstance(d, ast.Attribute) and d.attr == name:
+                return True
+        return False
+
+    def calculate_complexity(node) -> int:
+        """Calcule la complexité cyclomatique."""
+        complexity = 1
+        for child in ast.walk(node):
+            if isinstance(child, ast.If):
+                complexity += 1
+            elif isinstance(child, ast.For):
+                complexity += 1
+            elif isinstance(child, ast.While):
+                complexity += 1
+            elif isinstance(child, ast.ExceptHandler):
+                complexity += 1
+            elif isinstance(child, ast.With):
+                complexity += 1
+            elif isinstance(child, ast.comprehension):
+                complexity += 1
+            elif isinstance(child, ast.BoolOp):
+                complexity += len(child.values) - 1
+            elif isinstance(child, ast.IfExp):
+                complexity += 1
+        return complexity
+
+    def build_signature(node) -> str:
+        """Construit la signature d'une fonction."""
+        try:
+            args = []
+            for arg in node.args.args:
+                arg_str = arg.arg
+                if arg.annotation:
+                    arg_str += f": {ast.unparse(arg.annotation)}"
+                args.append(arg_str)
+
+            sig = f"({', '.join(args)})"
+            if node.returns:
+                sig += f" -> {ast.unparse(node.returns)}"
+            return sig
+        except Exception:
+            return "()"
 
     try:
         content = file_path.read_text(encoding="utf-8")
-        # Supprime les SyntaxWarning pour les escape sequences invalides
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=SyntaxWarning)
             tree = ast.parse(content)
 
         symbols = []
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                # Construire la signature
-                args = []
-                for arg in node.args.args:
-                    arg_str = arg.arg
-                    if arg.annotation:
-                        arg_str += f": {ast.unparse(arg.annotation)}"
-                    args.append(arg_str)
-
-                signature = f"({', '.join(args)})"
-                if node.returns:
-                    signature += f" -> {ast.unparse(node.returns)}"
+        # Parcourir de manière structurée (pas ast.walk pour éviter les doublons)
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Fonction de niveau module
+                visibility = get_visibility(node.name)
+                is_static = has_decorator(node.decorator_list, "staticmethod")
 
                 symbols.append({
                     "name": node.name,
                     "kind": "function",
                     "line_start": node.lineno,
                     "line_end": node.end_lineno,
-                    "signature": signature,
+                    "signature": build_signature(node),
+                    "visibility": visibility,
+                    "complexity": calculate_complexity(node),
+                    "is_static": is_static,
                     "doc_comment": ast.get_docstring(node),
                 })
 
             elif isinstance(node, ast.ClassDef):
-                bases = [ast.unparse(b) for b in node.bases]
+                # Classe
+                bases = []
+                for base in node.bases:
+                    try:
+                        bases.append(ast.unparse(base))
+                    except Exception:
+                        if isinstance(base, ast.Name):
+                            bases.append(base.id)
+
+                class_visibility = get_visibility(node.name)
+
                 symbols.append({
                     "name": node.name,
                     "kind": "class",
                     "line_start": node.lineno,
                     "line_end": node.end_lineno,
+                    "visibility": class_visibility,
                     "base_classes": bases,
                     "doc_comment": ast.get_docstring(node),
                 })
+
+                # Méthodes de la classe
+                for class_node in ast.iter_child_nodes(node):
+                    if isinstance(class_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        method_name = class_node.name
+                        method_visibility = get_visibility(method_name)
+                        is_static = has_decorator(class_node.decorator_list, "staticmethod")
+                        is_property = has_decorator(class_node.decorator_list, "property")
+
+                        kind = "property" if is_property else "method"
+
+                        symbols.append({
+                            "name": method_name,
+                            "qualified_name": f"{node.name}.{method_name}",
+                            "kind": kind,
+                            "line_start": class_node.lineno,
+                            "line_end": class_node.end_lineno,
+                            "signature": build_signature(class_node),
+                            "visibility": method_visibility,
+                            "complexity": calculate_complexity(class_node),
+                            "is_static": is_static,
+                            "doc_comment": ast.get_docstring(class_node),
+                        })
 
         return symbols
     except Exception:
@@ -686,22 +780,28 @@ def step_4_index_symbols(
         else:
             symbols = []
 
-        # Insérer les symboles
+        # Insérer les symboles avec tous les champs
         for sym in symbols:
             cursor.execute("""
                 INSERT INTO symbols (
-                    file_id, name, kind, line_start, line_end,
-                    signature, doc_comment, has_doc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    file_id, name, qualified_name, kind, line_start, line_end,
+                    signature, visibility, complexity, is_static,
+                    doc_comment, has_doc, base_classes_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 file_id,
                 sym.get("name", ""),
+                sym.get("qualified_name"),
                 sym.get("kind", "unknown"),
                 sym.get("line_start"),
                 sym.get("line_end"),
                 sym.get("signature", ""),
+                sym.get("visibility", "public"),
+                sym.get("complexity", 0),
+                1 if sym.get("is_static") else 0,
                 sym.get("doc_comment", ""),
                 1 if sym.get("doc_comment") else 0,
+                json.dumps(sym.get("base_classes")) if sym.get("base_classes") else None,
             ))
 
             sym_id = cursor.lastrowid
@@ -737,6 +837,254 @@ def step_4_index_symbols(
 
     stats.files_indexed = len(files)
     print(f"  {Colors.GREEN}✓{Colors.RESET} Indexed {stats.symbols_indexed} symbols, {stats.file_relations_indexed} file relations")
+
+
+# =============================================================================
+# STEP 4b: EXTRACT CALL RELATIONS
+# =============================================================================
+
+def extract_python_calls_for_bootstrap(
+    file_path: Path,
+    symbols: list[dict[str, Any]],
+    all_symbols: dict[str, int]
+) -> list[dict[str, Any]]:
+    """
+    Extrait les appels de fonction depuis un fichier Python en utilisant l'AST.
+
+    Args:
+        file_path: Chemin du fichier Python
+        symbols: Symboles définis dans ce fichier
+        all_symbols: Dict {symbol_name: symbol_id} de tous les symboles connus
+
+    Returns:
+        Liste de dict avec: caller, callee, line
+    """
+    import ast
+
+    try:
+        content = file_path.read_text(encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=SyntaxWarning)
+            tree = ast.parse(content, filename=str(file_path))
+    except Exception as e:
+        return []
+
+    calls = []
+
+    # Index des fonctions locales
+    local_functions = set()
+    for sym in symbols:
+        if sym.get("kind") in ("function", "method"):
+            local_functions.add(sym.get("name", ""))
+
+    class CallVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.current_function = None
+
+        def visit_FunctionDef(self, node):
+            old_func = self.current_function
+            self.current_function = node.name
+            self.generic_visit(node)
+            self.current_function = old_func
+
+        def visit_AsyncFunctionDef(self, node):
+            self.visit_FunctionDef(node)
+
+        def visit_Call(self, node):
+            callee_name = None
+
+            if isinstance(node.func, ast.Name):
+                callee_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                callee_name = node.func.attr
+
+            if callee_name and self.current_function:
+                # Vérifier que le callee est un symbole connu
+                if callee_name in all_symbols or callee_name in local_functions:
+                    if callee_name != self.current_function:
+                        calls.append({
+                            "caller": self.current_function,
+                            "callee": callee_name,
+                            "line": node.lineno,
+                        })
+
+            self.generic_visit(node)
+
+    visitor = CallVisitor()
+    visitor.visit(tree)
+
+    return calls
+
+
+def step_4b_extract_relations(
+    config: BootstrapConfig,
+    logger: logging.Logger,
+    stats: BootstrapStats,
+    files: list[dict[str, Any]]
+) -> None:
+    """Étape 4b : Extraire les relations d'appels entre symboles."""
+    print(f"\n{Colors.BOLD}Step 4b/9:{Colors.RESET} Extracting call relations...")
+
+    conn = sqlite3.connect(str(config.db_path))
+    cursor = conn.cursor()
+
+    # Construire l'index global des symboles: name -> id
+    cursor.execute("SELECT id, name FROM symbols")
+    all_symbols: dict[str, int] = {}
+    for row in cursor.fetchall():
+        all_symbols[row[1]] = row[0]
+
+    logger.info(f"Loaded {len(all_symbols)} symbols for relation extraction")
+
+    progress = ProgressBar(len(files), "Relations")
+    relations_count = 0
+
+    for file_info in files:
+        progress.update()
+
+        file_id = file_info["id"]
+        file_path = file_info["full_path"]
+        language = file_info.get("language", "")
+
+        # Récupérer les symboles de ce fichier
+        cursor.execute("""
+            SELECT id, name, kind, line_start, line_end
+            FROM symbols
+            WHERE file_id = ?
+        """, (file_id,))
+
+        file_symbols = []
+        for row in cursor.fetchall():
+            file_symbols.append({
+                "id": row[0],
+                "name": row[1],
+                "kind": row[2],
+                "line_start": row[3],
+                "line_end": row[4],
+            })
+
+        if not file_symbols:
+            continue
+
+        # Extraire les appels
+        calls = []
+        if language == "python":
+            calls = extract_python_calls_for_bootstrap(file_path, file_symbols, all_symbols)
+        elif language in ("c", "cpp", "javascript"):
+            # Utiliser regex pour C/C++/JS
+            calls = extract_calls_regex_for_bootstrap(file_path, file_symbols, all_symbols)
+
+        # Insérer les relations
+        for call in calls:
+            caller_name = call["caller"]
+            callee_name = call["callee"]
+            line = call["line"]
+
+            # Trouver les IDs
+            caller_id = all_symbols.get(caller_name)
+            callee_id = all_symbols.get(callee_name)
+
+            if caller_id and callee_id and caller_id != callee_id:
+                try:
+                    cursor.execute("""
+                        INSERT INTO relations (
+                            source_id, target_id, relation_type,
+                            location_file_id, location_line, count, is_direct
+                        ) VALUES (?, ?, 'calls', ?, ?, 1, 1)
+                    """, (caller_id, callee_id, file_id, line))
+                    relations_count += 1
+                except sqlite3.IntegrityError:
+                    # Relation déjà existante, incrémenter le compteur
+                    cursor.execute("""
+                        UPDATE relations SET count = count + 1
+                        WHERE source_id = ? AND target_id = ? AND relation_type = 'calls'
+                    """, (caller_id, callee_id))
+
+        logger.debug(f"Extracted {len(calls)} calls from {file_info['path']}")
+
+    progress.finish()
+    conn.commit()
+    conn.close()
+
+    stats.relations_indexed = relations_count
+    print(f"  {Colors.GREEN}✓{Colors.RESET} Extracted {relations_count} call relations")
+
+
+def extract_calls_regex_for_bootstrap(
+    file_path: Path,
+    symbols: list[dict[str, Any]],
+    all_symbols: dict[str, int]
+) -> list[dict[str, Any]]:
+    """
+    Extrait les appels de fonction avec regex (pour C/C++/JS).
+    """
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+
+    calls = []
+    lines = content.split("\n")
+
+    call_pattern = re.compile(r'\b([a-zA-Z_]\w*)\s*\(')
+
+    keywords = {
+        "if", "for", "while", "switch", "catch", "sizeof", "typeof",
+        "return", "else", "do", "case", "default", "break", "continue",
+        "struct", "class", "enum", "union", "typedef", "define",
+        "elif", "except", "with", "assert", "print",
+        "function", "const", "let", "var", "new",
+    }
+
+    # Index des fonctions locales avec leurs plages
+    local_functions = {}
+    for sym in symbols:
+        if sym.get("kind") in ("function", "method") and sym.get("line_start"):
+            local_functions[sym["name"]] = {
+                "start": sym["line_start"],
+                "end": sym.get("line_end") or sym["line_start"] + 200,
+            }
+
+    in_block_comment = False
+
+    for line_num, line in enumerate(lines, 1):
+        stripped = line.strip()
+
+        if "/*" in line:
+            in_block_comment = True
+        if "*/" in line:
+            in_block_comment = False
+            continue
+        if in_block_comment:
+            continue
+
+        if stripped.startswith("//") or stripped.startswith("#"):
+            continue
+
+        for match in call_pattern.finditer(line):
+            callee_name = match.group(1)
+
+            if callee_name in keywords:
+                continue
+
+            if callee_name not in all_symbols and callee_name not in local_functions:
+                continue
+
+            # Trouver le caller
+            caller_name = None
+            for func_name, func_info in local_functions.items():
+                if func_info["start"] <= line_num <= func_info["end"]:
+                    caller_name = func_name
+                    break
+
+            if caller_name and caller_name != callee_name:
+                calls.append({
+                    "caller": caller_name,
+                    "callee": callee_name,
+                    "line": line_num,
+                })
+
+    return calls
 
 
 # =============================================================================
@@ -1096,77 +1444,248 @@ def step_7_mark_critical(
 # =============================================================================
 
 DEFAULT_PATTERNS = [
+    # ==========================================================================
+    # ERROR HANDLING PATTERNS
+    # ==========================================================================
     {
         "name": "error_handling_malloc",
         "category": "error_handling",
         "title": "Check malloc return value",
-        "description": "Always check if malloc/calloc returns NULL before using the pointer",
+        "description": "Always check if malloc/calloc/realloc returns NULL before using the pointer. Memory allocation can fail when system is low on memory.",
         "severity": "error",
-        "good_example": "char *buf = malloc(size);\nif (buf == NULL) return -1;",
+        "good_example": "char *buf = malloc(size);\nif (buf == NULL) {\n    log_error(\"malloc failed\");\n    return -1;\n}",
         "bad_example": "char *buf = malloc(size);\nstrcpy(buf, data);  // Crash if malloc failed",
     },
     {
         "name": "error_handling_fopen",
         "category": "error_handling",
         "title": "Check fopen return value",
-        "description": "Always check if fopen returns NULL before using the file handle",
+        "description": "Always check if fopen returns NULL before using the file handle. File may not exist or permissions may be denied.",
         "severity": "error",
-        "good_example": "FILE *fp = fopen(path, \"r\");\nif (fp == NULL) return -1;",
-        "bad_example": "FILE *fp = fopen(path, \"r\");\nfread(buf, 1, size, fp);",
+        "good_example": "FILE *fp = fopen(path, \"r\");\nif (fp == NULL) {\n    perror(\"fopen failed\");\n    return -1;\n}",
+        "bad_example": "FILE *fp = fopen(path, \"r\");\nfread(buf, 1, size, fp);  // Crash if fopen failed",
     },
+    {
+        "name": "error_handling_return_codes",
+        "category": "error_handling",
+        "title": "Check function return codes",
+        "description": "Never ignore return codes from functions that can fail. Always check and handle errors appropriately.",
+        "severity": "warning",
+        "good_example": "int ret = process_data(data);\nif (ret != 0) {\n    log_error(\"process failed: %d\", ret);\n    return ret;\n}",
+        "bad_example": "process_data(data);  // Return code ignored\nnext_step();",
+    },
+    {
+        "name": "error_handling_errno",
+        "category": "error_handling",
+        "title": "Check errno after system calls",
+        "description": "After system calls that set errno on failure, check errno to get detailed error information.",
+        "severity": "info",
+        "good_example": "if (write(fd, buf, len) < 0) {\n    log_error(\"write failed: %s\", strerror(errno));\n    return -1;\n}",
+        "bad_example": "if (write(fd, buf, len) < 0) {\n    return -1;  // No error details\n}",
+    },
+
+    # ==========================================================================
+    # MEMORY SAFETY PATTERNS (C/C++)
+    # ==========================================================================
     {
         "name": "memory_safety_strncpy",
         "category": "memory_safety",
         "title": "Use strncpy instead of strcpy",
-        "description": "Prefer strncpy over strcpy to prevent buffer overflows",
+        "description": "Prefer strncpy over strcpy to prevent buffer overflows. Always null-terminate manually.",
         "severity": "warning",
         "good_example": "strncpy(dest, src, sizeof(dest) - 1);\ndest[sizeof(dest) - 1] = '\\0';",
-        "bad_example": "strcpy(dest, src);  // Buffer overflow risk",
+        "bad_example": "strcpy(dest, src);  // Buffer overflow if src > dest size",
+    },
+    {
+        "name": "memory_safety_snprintf",
+        "category": "memory_safety",
+        "title": "Use snprintf instead of sprintf",
+        "description": "Prefer snprintf over sprintf to prevent buffer overflows. Check return value for truncation.",
+        "severity": "warning",
+        "good_example": "int ret = snprintf(buf, sizeof(buf), \"value: %d\", val);\nif (ret >= sizeof(buf)) {\n    log_warn(\"output truncated\");\n}",
+        "bad_example": "sprintf(buf, \"value: %d\", val);  // Buffer overflow risk",
     },
     {
         "name": "memory_safety_free",
         "category": "memory_safety",
         "title": "Free allocated memory",
-        "description": "Every malloc must have a corresponding free",
+        "description": "Every malloc/calloc must have a corresponding free. Set pointer to NULL after free to prevent use-after-free.",
         "severity": "warning",
-        "good_example": "char *buf = malloc(size);\n// use buf\nfree(buf);",
+        "good_example": "char *buf = malloc(size);\nif (buf) {\n    // use buf\n    free(buf);\n    buf = NULL;\n}",
         "bad_example": "char *buf = malloc(size);\n// use buf\nreturn;  // Memory leak!",
     },
     {
-        "name": "naming_functions",
-        "category": "naming_convention",
-        "title": "Function naming convention",
-        "description": "Functions should use snake_case and be prefixed with module name",
-        "severity": "info",
-        "good_example": "int lcd_init(void);\nint lcd_write(uint8_t *data);",
-        "bad_example": "int LCDInit(void);\nint Write(uint8_t *data);",
+        "name": "memory_safety_bounds_check",
+        "category": "memory_safety",
+        "title": "Check array bounds",
+        "description": "Always verify array indices are within bounds before accessing. Prevents buffer overflows and underflows.",
+        "severity": "error",
+        "good_example": "if (index >= 0 && index < array_size) {\n    value = array[index];\n}",
+        "bad_example": "value = array[index];  // No bounds check",
     },
+    {
+        "name": "memory_safety_null_deref",
+        "category": "memory_safety",
+        "title": "Check pointers before dereferencing",
+        "description": "Always check that pointers are not NULL before dereferencing them.",
+        "severity": "error",
+        "good_example": "if (ptr != NULL) {\n    value = ptr->field;\n}",
+        "bad_example": "value = ptr->field;  // Crash if ptr is NULL",
+    },
+
+    # ==========================================================================
+    # NAMING CONVENTION PATTERNS
+    # ==========================================================================
+    {
+        "name": "naming_functions",
+        "category": "naming",
+        "title": "Function naming convention",
+        "description": "Functions should use snake_case and be prefixed with module name for clarity and to avoid naming conflicts.",
+        "severity": "info",
+        "good_example": "int lcd_init(void);\nint lcd_write(uint8_t *data);\nint gpio_set_pin(int pin, int value);",
+        "bad_example": "int LCDInit(void);  // CamelCase\nint Write(uint8_t *data);  // No prefix",
+    },
+    {
+        "name": "naming_constants",
+        "category": "naming",
+        "title": "Constant naming convention",
+        "description": "Constants and macros should use UPPER_SNAKE_CASE to distinguish them from variables.",
+        "severity": "info",
+        "good_example": "#define MAX_BUFFER_SIZE 1024\nconst int DEFAULT_TIMEOUT = 30;",
+        "bad_example": "#define maxBufferSize 1024  // Not uppercase",
+    },
+    {
+        "name": "naming_types",
+        "category": "naming",
+        "title": "Type naming convention",
+        "description": "User-defined types (structs, enums, typedefs) should use a consistent naming pattern, typically PascalCase or with _t suffix.",
+        "severity": "info",
+        "good_example": "typedef struct {\n    int x, y;\n} Point;\n\ntypedef enum { OK, ERROR } status_t;",
+        "bad_example": "typedef struct { int x, y; } point;  // Inconsistent naming",
+    },
+    {
+        "name": "naming_variables",
+        "category": "naming",
+        "title": "Variable naming convention",
+        "description": "Variables should use snake_case and have descriptive names. Avoid single-letter names except for loop counters.",
+        "severity": "info",
+        "good_example": "int buffer_size = 1024;\nchar *file_path = \"/tmp/data.txt\";",
+        "bad_example": "int bs = 1024;  // Unclear abbreviation\nchar *x;  // Non-descriptive",
+    },
+
+    # ==========================================================================
+    # DOCUMENTATION PATTERNS
+    # ==========================================================================
     {
         "name": "documentation_public",
         "category": "documentation",
         "title": "Document public functions",
-        "description": "All public functions should have documentation comments",
+        "description": "All public functions should have documentation comments describing purpose, parameters, return values, and possible errors.",
         "severity": "warning",
-        "good_example": "/**\n * Initialize the LCD controller.\n * @return 0 on success, -1 on error\n */\nint lcd_init(void);",
-        "bad_example": "int lcd_init(void);  // No documentation",
+        "good_example": "/**\n * Initialize the LCD controller.\n * \n * @param config LCD configuration structure\n * @return 0 on success, -1 on error (sets errno)\n */\nint lcd_init(LCD_Config *config);",
+        "bad_example": "int lcd_init(LCD_Config *config);  // No documentation",
     },
+    {
+        "name": "documentation_params",
+        "category": "documentation",
+        "title": "Document function parameters",
+        "description": "Document all function parameters including valid ranges, ownership semantics (for pointers), and whether they can be NULL.",
+        "severity": "info",
+        "good_example": "/**\n * Write data to LCD.\n * @param data Buffer to write (must not be NULL)\n * @param len  Number of bytes (1-256)\n */\nint lcd_write(const uint8_t *data, size_t len);",
+        "bad_example": "/** Write to LCD. */\nint lcd_write(const uint8_t *data, size_t len);",
+    },
+    {
+        "name": "documentation_module",
+        "category": "documentation",
+        "title": "Document modules/files",
+        "description": "Each source file should have a header comment describing its purpose and main responsibilities.",
+        "severity": "info",
+        "good_example": "/**\n * @file lcd_driver.c\n * @brief LCD display driver for HD44780 controllers\n * \n * Provides low-level interface for 16x2 character LCD.\n */",
+        "bad_example": "// lcd_driver.c\n#include <stdio.h>  // No module documentation",
+    },
+
+    # ==========================================================================
+    # SECURITY PATTERNS
+    # ==========================================================================
     {
         "name": "security_input_validation",
         "category": "security",
         "title": "Validate external input",
-        "description": "Always validate data from external sources (user input, network, files)",
+        "description": "Always validate data from external sources (user input, network, files). Check length, format, and range.",
         "severity": "error",
-        "good_example": "if (len > MAX_SIZE) return -1;\nif (data == NULL) return -1;",
+        "good_example": "if (len > MAX_SIZE || len == 0) return -1;\nif (data == NULL) return -1;\nif (!is_valid_format(data)) return -1;",
         "bad_example": "memcpy(buf, user_data, user_len);  // No validation!",
     },
+    {
+        "name": "security_sql_injection",
+        "category": "security",
+        "title": "Prevent SQL injection",
+        "description": "Use parameterized queries instead of string concatenation to prevent SQL injection attacks.",
+        "severity": "error",
+        "good_example": "cursor.execute(\"SELECT * FROM users WHERE id = ?\", (user_id,))",
+        "bad_example": "cursor.execute(f\"SELECT * FROM users WHERE id = {user_id}\")  // SQL injection!",
+    },
+    {
+        "name": "security_sensitive_data",
+        "category": "security",
+        "title": "Protect sensitive data",
+        "description": "Never log or expose sensitive data (passwords, tokens, keys). Clear sensitive data from memory after use.",
+        "severity": "error",
+        "good_example": "// Process password\nverify_password(password);\nmemset(password, 0, sizeof(password));  // Clear from memory",
+        "bad_example": "log_debug(\"User password: %s\", password);  // Never log passwords!",
+    },
+
+    # ==========================================================================
+    # PERFORMANCE PATTERNS
+    # ==========================================================================
     {
         "name": "performance_loop_invariant",
         "category": "performance",
         "title": "Move invariants out of loops",
-        "description": "Move calculations that don't change inside the loop to outside",
+        "description": "Move calculations that don't change inside the loop to outside. Reduces redundant computations.",
         "severity": "info",
-        "good_example": "size_t len = strlen(str);\nfor (int i = 0; i < len; i++) {...}",
-        "bad_example": "for (int i = 0; i < strlen(str); i++) {...}  // strlen called each iteration",
+        "good_example": "size_t len = strlen(str);\nfor (int i = 0; i < len; i++) {\n    process(str[i]);\n}",
+        "bad_example": "for (int i = 0; i < strlen(str); i++) {  // strlen called each iteration\n    process(str[i]);\n}",
+    },
+    {
+        "name": "performance_early_exit",
+        "category": "performance",
+        "title": "Use early exit conditions",
+        "description": "Check for invalid conditions early and return/continue to avoid unnecessary processing.",
+        "severity": "info",
+        "good_example": "if (data == NULL || len == 0) return;\nif (already_processed) return;\n// Main processing here",
+        "bad_example": "if (data != NULL && len > 0 && !already_processed) {\n    // Deeply nested processing\n}",
+    },
+
+    # ==========================================================================
+    # PYTHON-SPECIFIC PATTERNS
+    # ==========================================================================
+    {
+        "name": "python_exception_handling",
+        "category": "error_handling",
+        "title": "Handle exceptions properly",
+        "description": "Catch specific exceptions, not bare except. Log or handle the error appropriately.",
+        "severity": "warning",
+        "good_example": "try:\n    result = process(data)\nexcept ValueError as e:\n    logger.error(f\"Invalid data: {e}\")\n    raise",
+        "bad_example": "try:\n    result = process(data)\nexcept:  # Catches everything including KeyboardInterrupt!\n    pass",
+    },
+    {
+        "name": "python_context_managers",
+        "category": "memory_safety",
+        "title": "Use context managers for resources",
+        "description": "Use 'with' statements for files, locks, and other resources to ensure proper cleanup.",
+        "severity": "warning",
+        "good_example": "with open(path, 'r') as f:\n    data = f.read()\n# File automatically closed",
+        "bad_example": "f = open(path, 'r')\ndata = f.read()\n# f.close() might never be called on exception",
+    },
+    {
+        "name": "python_type_hints",
+        "category": "documentation",
+        "title": "Use type hints",
+        "description": "Add type hints to function signatures for better documentation and IDE support.",
+        "severity": "info",
+        "good_example": "def process(data: list[str], count: int) -> dict[str, int]:\n    ...",
+        "bad_example": "def process(data, count):\n    ...  # Types unclear",
     },
 ]
 
@@ -1392,6 +1911,10 @@ def main() -> int:
         # Step 4: Index symbols
         if success and files:
             step_4_index_symbols(config, logger, stats, files)
+
+        # Step 4b: Extract relations (calls)
+        if success and files:
+            step_4b_extract_relations(config, logger, stats, files)
 
         # Step 5: Calculate metrics
         if success and files:

@@ -215,13 +215,14 @@ def check_ctags_available(ctags_path: Optional[str] = None) -> tuple[bool, str]:
         return False, f"Error checking ctags: {e}"
 
 
-def run_ctags(file_path: str, ctags_path: str = "ctags") -> list[dict[str, Any]]:
+def run_ctags(file_path: str, ctags_path: str = "ctags", language: str = None) -> list[dict[str, Any]]:
     """
     Exécute ctags sur un fichier et retourne les tags au format JSON.
 
     Args:
         file_path: Chemin du fichier à analyser
         ctags_path: Chemin vers l'exécutable ctags
+        language: Langage du fichier (c, cpp, etc.)
 
     Returns:
         Liste des tags extraits (dict par tag)
@@ -231,7 +232,7 @@ def run_ctags(file_path: str, ctags_path: str = "ctags") -> list[dict[str, Any]]
         RuntimeError: Si ctags échoue
 
     Example:
-        >>> tags = run_ctags("src/main.c")
+        >>> tags = run_ctags("src/main.c", language="c")
         >>> for tag in tags:
         ...     print(f"{tag['name']} ({tag['kind']}) at line {tag['line']}")
     """
@@ -239,15 +240,29 @@ def run_ctags(file_path: str, ctags_path: str = "ctags") -> list[dict[str, Any]]
     if not path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    # Options ctags pour sortie JSON avec tous les champs utiles
+    # Options ctags optimisées pour extraction complète
+    # --fields=+iaS : i=inheritance, a=access, S=signature
+    # --extras=+q : qualified tags (namespace::class::method)
+    # --c++-kinds=+p : inclure prototypes pour C++
     cmd = [
         ctags_path,
         "--output-format=json",
-        "--fields=+neKSl",  # n=line, e=end, K=kind(long), S=signature, l=language
+        "--fields=+iaSneSKlZ",  # i=inheritance, a=access, S=signature, n=line, e=end, K=kind, l=lang, Z=scope
+        "--extras=+q",  # qualified names
         "--kinds-all=*",
+    ]
+
+    # Options spécifiques au langage
+    if language in ("c", "cpp"):
+        cmd.extend([
+            "--c-kinds=+p+x+l",  # +p=prototypes, +x=externs, +l=local vars
+            "--c++-kinds=+p+l",  # +p=prototypes, +l=local vars
+        ])
+
+    cmd.extend([
         "-o", "-",  # Sortie sur stdout
         str(path.absolute())
-    ]
+    ])
 
     try:
         result = subprocess.run(
@@ -257,7 +272,8 @@ def run_ctags(file_path: str, ctags_path: str = "ctags") -> list[dict[str, Any]]
             timeout=30
         )
 
-        if result.returncode != 0:
+        # ctags peut retourner 0 même avec des warnings, on vérifie stdout
+        if result.returncode != 0 and not result.stdout.strip():
             error_msg = result.stderr.strip() or "Unknown ctags error"
             raise RuntimeError(f"ctags failed: {error_msg}")
 
@@ -298,13 +314,14 @@ def parse_ctags_output(output: str) -> list[dict[str, Any]]:
     return tags
 
 
-def ctags_to_symbols(tags: list[dict[str, Any]], file_id: int) -> list[Symbol]:
+def ctags_to_symbols(tags: list[dict[str, Any]], file_id: int, file_content: str = None) -> list[Symbol]:
     """
-    Convertit les tags ctags en objets Symbol.
+    Convertit les tags ctags en objets Symbol avec tous les champs remplis.
 
     Args:
         tags: Liste des tags de ctags
         file_id: ID du fichier dans la base
+        file_content: Contenu du fichier (pour calcul de complexité)
 
     Returns:
         Liste de Symbol
@@ -332,7 +349,11 @@ def ctags_to_symbols(tags: list[dict[str, Any]], file_id: int) -> list[Symbol]:
         "property": "property",
         "constant": "constant",
         "parameter": "parameter",
+        "local": "variable",
     }
+
+    # Pré-calculer les lignes pour la complexité
+    lines = file_content.split("\n") if file_content else []
 
     for tag in tags:
         name = tag.get("name", "")
@@ -350,41 +371,125 @@ def ctags_to_symbols(tags: list[dict[str, Any]], file_id: int) -> list[Symbol]:
         if not signature and kind in ("function", "method", "prototype"):
             # Le pattern est souvent /^type name(params)$/
             if pattern:
-                sig_match = re.search(r'(\w+\s+\*?\s*' + re.escape(name) + r'\s*\([^)]*\))', pattern)
+                # Nettoyer le pattern (enlever /^ et $/)
+                clean_pattern = pattern.strip("/^$")
+                sig_match = re.search(r'(\w[\w\s\*]*\s+\*?\s*' + re.escape(name) + r'\s*\([^)]*\))', clean_pattern)
                 if sig_match:
-                    signature = sig_match.group(1)
+                    signature = sig_match.group(1).strip()
 
         # Extraire le type de retour
-        return_type = None
-        if kind in ("function", "method") and signature:
-            # Essayer d'extraire le type de retour
-            match = re.match(r'^(\w+(?:\s*\*)?)\s+' + re.escape(name), signature)
+        return_type = tag.get("typeref", "")
+        if not return_type and kind in ("function", "method") and signature:
+            # Essayer d'extraire le type de retour de la signature
+            match = re.match(r'^([\w\s\*]+?)\s+\*?\s*' + re.escape(name), signature)
             if match:
                 return_type = match.group(1).strip()
 
-        # Déterminer la visibilité
+        # Déterminer la visibilité depuis le champ 'access' de ctags
+        access = tag.get("access", "").lower()
         visibility = "public"
+        if access in ("private", "protected", "public"):
+            visibility = access
+        elif "static" in pattern.lower():
+            visibility = "private"  # static en C = portée fichier = private
+        elif tag.get("file"):  # tag marqué comme file-scope
+            visibility = "private"
+
+        # Extraire le scope (namespace, class, struct)
         scope = tag.get("scope", "")
-        if "static" in pattern.lower() or tag.get("properties", ""):
-            visibility = "static"
-        elif scope:
-            visibility = "private"  # Membre de quelque chose
+        scope_kind = tag.get("scopeKind", "")
+
+        # Construire le qualified_name
+        qualified_name = None
+        if scope:
+            qualified_name = f"{scope}::{name}"
+        elif tag.get("extras") and "qualified" in str(tag.get("extras", "")):
+            qualified_name = name  # Déjà qualifié
+
+        # Calculer la complexité pour les fonctions
+        complexity = 0
+        line_start = tag.get("line")
+        line_end = tag.get("end")
+
+        if kind in ("function", "method") and lines and line_start:
+            complexity = _calculate_function_complexity(lines, line_start, line_end)
+
+        # Extraire les informations d'héritage
+        inherits = tag.get("inherits", "")
+        base_classes = None
+        if inherits:
+            base_classes = [b.strip() for b in inherits.split(",")]
+
+        # Détecter si c'est static/inline/extern
+        is_static = "static" in pattern.lower() if pattern else False
+        is_inline = "inline" in pattern.lower() if pattern else False
+        is_extern = tag.get("kind") == "externvar" or ("extern" in pattern.lower() if pattern else False)
 
         symbol = Symbol(
             file_id=file_id,
             name=name,
-            qualified_name=f"{scope}::{name}" if scope else None,
+            qualified_name=qualified_name,
             kind=kind,
-            line_start=tag.get("line"),
-            line_end=tag.get("end"),
+            line_start=line_start,
+            line_end=line_end,
             signature=signature if signature else None,
-            return_type=return_type,
+            return_type=return_type if return_type else None,
             visibility=visibility,
-            is_static="static" in pattern.lower() if pattern else False,
+            is_static=is_static,
+            is_inline=is_inline,
+            is_exported=not is_static and visibility == "public",
+            complexity=complexity,
+            base_classes_json=json.dumps(base_classes) if base_classes else None,
         )
         symbols.append(symbol)
 
     return symbols
+
+
+def _calculate_function_complexity(lines: list[str], start: int, end: int = None) -> int:
+    """
+    Calcule la complexité cyclomatique d'une fonction.
+
+    Args:
+        lines: Lignes du fichier
+        start: Ligne de début (1-indexed)
+        end: Ligne de fin (1-indexed), ou None pour estimer
+
+    Returns:
+        Complexité cyclomatique
+    """
+    if not lines or start is None:
+        return 0
+
+    # Ajuster pour index 0-based
+    start_idx = max(0, start - 1)
+    end_idx = min(len(lines), (end or start + 100))
+
+    # Extraire le code de la fonction
+    func_lines = lines[start_idx:end_idx]
+    func_code = "\n".join(func_lines)
+
+    # Compter les points de décision
+    complexity = 1  # Base
+
+    patterns = [
+        r'\bif\s*\(',
+        r'\belse\s+if\s*\(',
+        r'\bfor\s*\(',
+        r'\bwhile\s*\(',
+        r'\bdo\s*\{',
+        r'\bcase\s+\S+\s*:',
+        r'\bcatch\s*\(',
+        r'\b\?\s*[^:]+\s*:',  # ternaire
+        r'\s&&\s',
+        r'\s\|\|\s',
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, func_code)
+        complexity += len(matches)
+
+    return complexity
 
 
 # =============================================================================
@@ -656,16 +761,159 @@ def extract_includes(file_path: str, language: Optional[str] = None) -> list[dic
     return includes
 
 
-def extract_calls(
+def extract_python_calls(
     file_path: str,
-    symbols: list[Symbol],
+    symbols: list,
     all_symbols: dict[str, int]
 ) -> list[dict[str, Any]]:
     """
-    Extrait les appels de fonction depuis un fichier.
+    Extrait les appels de fonction depuis un fichier Python en utilisant l'AST.
 
-    Cette fonction fait une analyse simple basée sur regex.
-    Pour une analyse plus précise, utiliser un vrai parser (tree-sitter).
+    Cette méthode est précise car elle utilise l'AST Python natif.
+
+    Args:
+        file_path: Chemin du fichier Python
+        symbols: Symboles définis dans ce fichier (avec line_start, line_end)
+        all_symbols: Dict {symbol_name: symbol_id} de tous les symboles connus
+
+    Returns:
+        Liste de dict avec: caller, callee, line
+    """
+    import ast
+
+    try:
+        content = Path(file_path).read_text(encoding="utf-8")
+        tree = ast.parse(content, filename=file_path)
+    except Exception as e:
+        logger.warning(f"Cannot parse {file_path} for call extraction: {e}")
+        return []
+
+    calls = []
+
+    # Construire un index des fonctions/méthodes locales avec leurs plages de lignes
+    local_functions = {}
+    for sym in symbols:
+        if hasattr(sym, 'kind'):
+            kind = sym.kind
+            name = sym.name
+            line_start = sym.line_start
+            line_end = sym.line_end
+        else:
+            kind = sym.get('kind', '')
+            name = sym.get('name', '')
+            line_start = sym.get('line_start')
+            line_end = sym.get('line_end')
+
+        if kind in ("function", "method") and line_start:
+            local_functions[name] = {
+                "start": line_start,
+                "end": line_end or line_start + 500,
+            }
+
+    class CallVisitor(ast.NodeVisitor):
+        """Visiteur AST pour extraire les appels de fonction."""
+
+        def __init__(self):
+            self.current_function = None
+            self.current_class = None
+
+        def visit_FunctionDef(self, node):
+            old_func = self.current_function
+            self.current_function = node.name
+            self.generic_visit(node)
+            self.current_function = old_func
+
+        def visit_AsyncFunctionDef(self, node):
+            self.visit_FunctionDef(node)
+
+        def visit_ClassDef(self, node):
+            old_class = self.current_class
+            self.current_class = node.name
+            self.generic_visit(node)
+            self.current_class = old_class
+
+        def visit_Call(self, node):
+            callee_name = None
+
+            # Appel simple: func()
+            if isinstance(node.func, ast.Name):
+                callee_name = node.func.id
+
+            # Appel de méthode: obj.method() - on prend juste le nom de la méthode
+            elif isinstance(node.func, ast.Attribute):
+                callee_name = node.func.attr
+
+            if callee_name and self.current_function:
+                # Vérifier que le callee est un symbole connu
+                if callee_name in all_symbols or callee_name in local_functions:
+                    # Éviter les auto-appels
+                    if callee_name != self.current_function:
+                        calls.append({
+                            "caller": self.current_function,
+                            "callee": callee_name,
+                            "line": node.lineno,
+                        })
+
+            self.generic_visit(node)
+
+    visitor = CallVisitor()
+    visitor.visit(tree)
+
+    return calls
+
+
+def extract_calls(
+    file_path: str,
+    symbols: list,
+    all_symbols: dict[str, int],
+    language: str = None
+) -> list[dict[str, Any]]:
+    """
+    Extrait les appels de fonction depuis un fichier source.
+
+    Utilise l'AST pour Python, regex pour C/C++/JS.
+
+    Args:
+        file_path: Chemin du fichier source
+        symbols: Symboles définis dans ce fichier
+        all_symbols: Dict {symbol_name: symbol_id} de tous les symboles connus
+        language: Langage du fichier (python, c, cpp, javascript)
+
+    Returns:
+        Liste de dict avec: caller, callee, line
+
+    Example:
+        >>> calls = extract_calls("src/main.py", local_symbols, global_symbols, "python")
+        >>> for call in calls:
+        ...     print(f"{call['caller']} calls {call['callee']} at line {call['line']}")
+    """
+    # Détection du langage si non fourni
+    if language is None:
+        ext = Path(file_path).suffix.lower()
+        if ext in (".py", ".pyi"):
+            language = "python"
+        elif ext in (".c", ".h"):
+            language = "c"
+        elif ext in (".cpp", ".hpp", ".cc", ".hh", ".cxx", ".hxx"):
+            language = "cpp"
+        elif ext in (".js", ".jsx", ".ts", ".tsx"):
+            language = "javascript"
+
+    # Pour Python, utiliser l'AST
+    if language == "python":
+        return extract_python_calls(file_path, symbols, all_symbols)
+
+    # Pour C/C++/JS, utiliser regex
+    return extract_calls_regex(file_path, symbols, all_symbols)
+
+
+def extract_calls_regex(
+    file_path: str,
+    symbols: list,
+    all_symbols: dict[str, int]
+) -> list[dict[str, Any]]:
+    """
+    Extrait les appels de fonction avec regex (pour C/C++/JS).
 
     Args:
         file_path: Chemin du fichier source
@@ -673,12 +921,7 @@ def extract_calls(
         all_symbols: Dict {symbol_name: symbol_id} de tous les symboles connus
 
     Returns:
-        Liste de dict avec: caller_id, callee_name, line
-
-    Example:
-        >>> calls = extract_calls("src/main.c", local_symbols, global_symbols)
-        >>> for call in calls:
-        ...     print(f"{call['caller']} calls {call['callee']} at line {call['line']}")
+        Liste de dict avec: caller, callee, line
     """
     try:
         content = Path(file_path).read_text(encoding="utf-8", errors="replace")
@@ -694,29 +937,59 @@ def extract_calls(
 
     # Mots-clés à ignorer (pas des appels de fonction)
     keywords = {
-        "if", "for", "while", "switch", "catch", "sizeof", "typeof",
-        "return", "else", "do", "case", "default", "break", "continue",
-        "struct", "class", "enum", "union", "typedef", "define",
-        "elif", "except", "with", "assert", "print",  # Python
-        "function", "const", "let", "var", "new",  # JS
+        # C/C++
+        "if", "for", "while", "switch", "catch", "sizeof", "typeof", "alignof",
+        "return", "else", "do", "case", "default", "break", "continue", "goto",
+        "struct", "class", "enum", "union", "typedef", "define", "ifdef", "ifndef",
+        "include", "pragma", "static_cast", "dynamic_cast", "const_cast", "reinterpret_cast",
+        # Python (au cas où)
+        "elif", "except", "with", "assert", "print", "lambda", "yield", "async", "await",
+        # JS
+        "function", "const", "let", "var", "new", "delete", "instanceof", "typeof",
     }
 
-    # Trouver les fonctions définies dans ce fichier avec leurs lignes
+    # Construire l'index des fonctions locales avec leurs plages
     local_functions = {}
     for sym in symbols:
-        if sym.kind in ("function", "method") and sym.line_start:
-            local_functions[sym.name] = {
-                "id": sym.id,
-                "start": sym.line_start,
-                "end": sym.line_end or sym.line_start + 100,
+        if hasattr(sym, 'kind'):
+            kind = sym.kind
+            name = sym.name
+            line_start = sym.line_start
+            line_end = sym.line_end
+        else:
+            kind = sym.get('kind', '')
+            name = sym.get('name', '')
+            line_start = sym.get('line_start')
+            line_end = sym.get('line_end')
+
+        if kind in ("function", "method") and line_start:
+            local_functions[name] = {
+                "start": line_start,
+                "end": line_end or line_start + 200,
             }
 
+    # État pour ignorer les commentaires multi-lignes
+    in_block_comment = False
+
     for line_num, line in enumerate(lines, 1):
-        # Ignorer les commentaires et preprocessor
         stripped = line.strip()
-        if stripped.startswith("//") or stripped.startswith("#") or stripped.startswith("/*"):
+
+        # Gestion des commentaires bloc /* */
+        if "/*" in line:
+            in_block_comment = True
+        if "*/" in line:
+            in_block_comment = False
+            continue
+        if in_block_comment:
             continue
 
+        # Ignorer les commentaires ligne et preprocessor
+        if stripped.startswith("//") or stripped.startswith("/*"):
+            continue
+        if stripped.startswith("#") and not stripped.startswith("#include"):
+            continue
+
+        # Chercher les appels dans la ligne
         for match in call_pattern.finditer(line):
             callee_name = match.group(1)
 
@@ -724,8 +997,8 @@ def extract_calls(
             if callee_name in keywords:
                 continue
 
-            # Ignorer si le callee n'est pas un symbole connu
-            if callee_name not in all_symbols:
+            # Vérifier que le callee est un symbole connu
+            if callee_name not in all_symbols and callee_name not in local_functions:
                 continue
 
             # Trouver le caller (fonction qui contient cette ligne)
@@ -735,7 +1008,8 @@ def extract_calls(
                     caller_name = func_name
                     break
 
-            if caller_name and caller_name != callee_name:  # Pas d'auto-appel simple
+            # Si on a un caller et ce n'est pas un auto-appel
+            if caller_name and caller_name != callee_name:
                 calls.append({
                     "caller": caller_name,
                     "callee": callee_name,
@@ -900,16 +1174,24 @@ class CodeIndexer:
 
             result.file_id = file_id
 
-            # Extraire les symboles avec ctags (pour C/C++)
+            # Extraire les symboles avec ctags (pour C/C++) ou AST (pour Python)
             symbols = []
             if language in ("c", "cpp") and self.ctags_available:
                 try:
-                    tags = run_ctags(str(full_path), self.ctags_path)
-                    symbols = ctags_to_symbols(tags, file_id)
+                    tags = run_ctags(str(full_path), self.ctags_path, language=language)
+                    symbols = ctags_to_symbols(tags, file_id, file_content=content)
                 except Exception as e:
                     result.warnings.append(f"ctags failed: {e}")
+                    logger.warning(f"ctags failed for {file_path}: {e}")
             elif language == "python":
                 symbols = self._extract_python_symbols(full_path, file_id)
+            elif language == "javascript" and self.ctags_available:
+                # Fallback ctags pour JavaScript/TypeScript
+                try:
+                    tags = run_ctags(str(full_path), self.ctags_path, language=language)
+                    symbols = ctags_to_symbols(tags, file_id, file_content=content)
+                except Exception as e:
+                    result.warnings.append(f"ctags failed for JS: {e}")
 
             # Insérer les symboles
             for sym in symbols:
@@ -1185,7 +1467,15 @@ class CodeIndexer:
         )
 
     def _extract_python_symbols(self, file_path: Path, file_id: int) -> list[Symbol]:
-        """Extrait les symboles d'un fichier Python avec ast."""
+        """
+        Extrait les symboles d'un fichier Python avec ast.
+
+        Détecte :
+        - Fonctions (def) avec signature, visibilité, complexité
+        - Classes avec bases d'héritage
+        - Méthodes dans les classes (kind="method")
+        - Propriétés (@property)
+        """
         import ast
 
         try:
@@ -1199,10 +1489,70 @@ class CodeIndexer:
             return []
 
         symbols = []
+        lines = content.split("\n")
 
-        for node in ast.walk(tree):
+        def get_visibility(name: str, decorators: list) -> str:
+            """Détermine la visibilité d'un symbole Python."""
+            # Convention Python: _name = private, __name = very private
+            if name.startswith("__") and not name.endswith("__"):
+                return "private"
+            elif name.startswith("_"):
+                return "protected"
+            return "public"
+
+        def has_decorator(decorators: list, name: str) -> bool:
+            """Vérifie si un décorateur est présent."""
+            for d in decorators:
+                if isinstance(d, ast.Name) and d.id == name:
+                    return True
+                elif isinstance(d, ast.Attribute) and d.attr == name:
+                    return True
+            return False
+
+        def calculate_python_complexity(node) -> int:
+            """Calcule la complexité cyclomatique d'une fonction Python."""
+            complexity = 1
+
+            for child in ast.walk(node):
+                if isinstance(child, ast.If):
+                    complexity += 1
+                elif isinstance(child, ast.For):
+                    complexity += 1
+                elif isinstance(child, ast.While):
+                    complexity += 1
+                elif isinstance(child, ast.ExceptHandler):
+                    complexity += 1
+                elif isinstance(child, ast.With):
+                    complexity += 1
+                elif isinstance(child, ast.Assert):
+                    complexity += 1
+                elif isinstance(child, ast.comprehension):
+                    complexity += 1
+                elif isinstance(child, ast.BoolOp):
+                    # and/or ajoutent de la complexité
+                    complexity += len(child.values) - 1
+                elif isinstance(child, ast.IfExp):  # ternaire
+                    complexity += 1
+
+            return complexity
+
+        def extract_return_type(node) -> Optional[str]:
+            """Extrait le type de retour d'une fonction."""
+            if node.returns:
+                try:
+                    return ast.unparse(node.returns)
+                except Exception:
+                    return None
+            return None
+
+        # Parcourir l'AST de manière structurée
+        for node in ast.iter_child_nodes(tree):
+            # Fonctions de niveau module
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Fonction
+                is_async = isinstance(node, ast.AsyncFunctionDef)
+                visibility = get_visibility(node.name, node.decorator_list)
+                is_static = has_decorator(node.decorator_list, "staticmethod")
+
                 sym = Symbol(
                     file_id=file_id,
                     name=node.name,
@@ -1210,49 +1560,134 @@ class CodeIndexer:
                     line_start=node.lineno,
                     line_end=node.end_lineno,
                     signature=self._get_python_signature(node),
-                    is_static=any(
-                        isinstance(d, ast.Name) and d.id == "staticmethod"
-                        for d in node.decorator_list
-                    ),
+                    return_type=extract_return_type(node),
+                    visibility=visibility,
+                    is_static=is_static,
+                    is_exported=visibility == "public",
+                    complexity=calculate_python_complexity(node),
+                    doc_comment=ast.get_docstring(node),
+                    has_doc=ast.get_docstring(node) is not None,
                 )
                 symbols.append(sym)
 
+            # Classes
             elif isinstance(node, ast.ClassDef):
-                # Classe
-                bases = [
-                    base.id if isinstance(base, ast.Name) else str(base)
-                    for base in node.bases
-                ]
-                sym = Symbol(
+                bases = []
+                for base in node.bases:
+                    try:
+                        bases.append(ast.unparse(base))
+                    except Exception:
+                        if isinstance(base, ast.Name):
+                            bases.append(base.id)
+
+                class_visibility = get_visibility(node.name, node.decorator_list)
+
+                class_sym = Symbol(
                     file_id=file_id,
                     name=node.name,
                     kind="class",
                     line_start=node.lineno,
                     line_end=node.end_lineno,
+                    visibility=class_visibility,
+                    is_exported=class_visibility == "public",
                     base_classes_json=json.dumps(bases) if bases else None,
+                    doc_comment=ast.get_docstring(node),
+                    has_doc=ast.get_docstring(node) is not None,
                 )
-                symbols.append(sym)
+                symbols.append(class_sym)
+
+                # Extraire les méthodes de la classe
+                for class_node in ast.iter_child_nodes(node):
+                    if isinstance(class_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        method_name = class_node.name
+                        method_visibility = get_visibility(method_name, class_node.decorator_list)
+
+                        # Déterminer le type de méthode
+                        is_static = has_decorator(class_node.decorator_list, "staticmethod")
+                        is_classmethod = has_decorator(class_node.decorator_list, "classmethod")
+                        is_property = has_decorator(class_node.decorator_list, "property")
+
+                        kind = "method"
+                        if is_property:
+                            kind = "property"
+
+                        method_sym = Symbol(
+                            file_id=file_id,
+                            name=method_name,
+                            qualified_name=f"{node.name}.{method_name}",
+                            kind=kind,
+                            line_start=class_node.lineno,
+                            line_end=class_node.end_lineno,
+                            signature=self._get_python_signature(class_node),
+                            return_type=extract_return_type(class_node),
+                            visibility=method_visibility,
+                            is_static=is_static,
+                            is_exported=method_visibility == "public" and class_visibility == "public",
+                            complexity=calculate_python_complexity(class_node),
+                            doc_comment=ast.get_docstring(class_node),
+                            has_doc=ast.get_docstring(class_node) is not None,
+                        )
+                        symbols.append(method_sym)
 
         return symbols
 
     def _get_python_signature(self, node) -> Optional[str]:
-        """Construit la signature d'une fonction Python."""
+        """Construit la signature complète d'une fonction Python."""
         import ast
 
         try:
-            args = []
-            for arg in node.args.args:
+            args_parts = []
+
+            # Arguments positionnels normaux
+            defaults_offset = len(node.args.args) - len(node.args.defaults)
+            for i, arg in enumerate(node.args.args):
                 arg_str = arg.arg
                 if arg.annotation:
                     arg_str += f": {ast.unparse(arg.annotation)}"
-                args.append(arg_str)
+                # Ajouter la valeur par défaut si présente
+                default_idx = i - defaults_offset
+                if default_idx >= 0 and default_idx < len(node.args.defaults):
+                    try:
+                        arg_str += f" = {ast.unparse(node.args.defaults[default_idx])}"
+                    except Exception:
+                        arg_str += " = ..."
+                args_parts.append(arg_str)
 
-            sig = f"def {node.name}({', '.join(args)})"
+            # *args
+            if node.args.vararg:
+                vararg = f"*{node.args.vararg.arg}"
+                if node.args.vararg.annotation:
+                    vararg += f": {ast.unparse(node.args.vararg.annotation)}"
+                args_parts.append(vararg)
+
+            # keyword-only args
+            for i, arg in enumerate(node.args.kwonlyargs):
+                arg_str = arg.arg
+                if arg.annotation:
+                    arg_str += f": {ast.unparse(arg.annotation)}"
+                if i < len(node.args.kw_defaults) and node.args.kw_defaults[i]:
+                    try:
+                        arg_str += f" = {ast.unparse(node.args.kw_defaults[i])}"
+                    except Exception:
+                        arg_str += " = ..."
+                args_parts.append(arg_str)
+
+            # **kwargs
+            if node.args.kwarg:
+                kwarg = f"**{node.args.kwarg.arg}"
+                if node.args.kwarg.annotation:
+                    kwarg += f": {ast.unparse(node.args.kwarg.annotation)}"
+                args_parts.append(kwarg)
+
+            # Construire la signature
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            sig = f"{prefix} {node.name}({', '.join(args_parts)})"
             if node.returns:
                 sig += f" -> {ast.unparse(node.returns)}"
             return sig
-        except Exception:
-            return None
+        except Exception as e:
+            logger.debug(f"Could not build signature for {node.name}: {e}")
+            return f"def {node.name}(...)"
 
 
 # =============================================================================

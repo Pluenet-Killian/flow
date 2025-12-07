@@ -91,8 +91,8 @@ def get_file_context(
                 "complexity_max": file_obj.complexity_max or 0,
             },
             "activity": {
-                "commits_30d": file_obj.git_commits_30d or 0,
-                "commits_90d": file_obj.git_commits_90d or 0,
+                "commits_30d": file_obj.commits_30d or 0,
+                "commits_90d": file_obj.commits_90d or 0,
                 "last_modified": file_obj.last_modified,
                 "contributors": _get_file_contributors(db, file_obj.id),
             },
@@ -666,6 +666,7 @@ def get_patterns(
     file_path: Optional[str] = None,
     module: Optional[str] = None,
     category: Optional[str] = None,
+    include_examples: bool = True,
 ) -> dict[str, Any]:
     """
     Récupère les patterns de code applicables à un fichier ou module.
@@ -777,6 +778,7 @@ def get_architecture_decisions(
     module: Optional[str] = None,
     file_path: Optional[str] = None,
     status: str = "accepted",
+    include_superseded: bool = False,
 ) -> dict[str, Any]:
     """
     Récupère les décisions architecturales (ADR) applicables.
@@ -795,7 +797,10 @@ def get_architecture_decisions(
     params: list[Any] = []
 
     if status:
-        query += " AND status = ?"
+        if include_superseded:
+            query += " AND (status = ? OR status = 'superseded')"
+        else:
+            query += " AND status = ?"
         params.append(status)
 
     if module:
@@ -856,6 +861,7 @@ def search_symbols(
     query: str,
     kind: Optional[str] = None,
     module: Optional[str] = None,
+    file_path: Optional[str] = None,
     limit: int = 50
 ) -> dict[str, Any]:
     """
@@ -894,6 +900,10 @@ def search_symbols(
         count_sql += " AND f.module = ?"
         count_params.append(module)
 
+    if file_path:
+        count_sql += " AND f.path = ?"
+        count_params.append(file_path)
+
     # Requête principale avec limite
     sql = """
         SELECT s.*, f.path as file_path, f.module
@@ -910,6 +920,10 @@ def search_symbols(
     if module:
         sql += " AND f.module = ?"
         params.append(module)
+
+    if file_path:
+        sql += " AND f.path = ?"
+        params.append(file_path)
 
     sql += " ORDER BY s.name LIMIT ?"
     params.append(limit)
@@ -959,6 +973,7 @@ def search_symbols(
 def get_file_metrics(
     db,
     path: str,
+    include_per_function: bool = False,
 ) -> dict[str, Any]:
     """
     Récupère les métriques détaillées d'un fichier.
@@ -1018,7 +1033,6 @@ def get_file_metrics(
             "lines_code": file_obj.lines_code or 0,
             "lines_comment": file_obj.lines_comment or 0,
             "lines_blank": file_obj.lines_blank or 0,
-            "bytes": file_obj.size_bytes or 0,
         },
         "complexity": {
             "cyclomatic_total": file_obj.complexity_sum or 0,
@@ -1039,9 +1053,9 @@ def get_file_metrics(
             "technical_debt_score": tech_debt_score,
         },
         "activity": {
-            "commits_30d": file_obj.git_commits_30d or 0,
-            "commits_90d": file_obj.git_commits_90d or 0,
-            "commits_365d": getattr(file_obj, 'git_commits_365d', None) or 0,
+            "commits_30d": file_obj.commits_30d or 0,
+            "commits_90d": file_obj.commits_90d or 0,
+            "commits_365d": file_obj.commits_365d or 0,
             "contributors": contributors,
             "last_modified": file_obj.last_modified,
             "age_days": age_days,
@@ -1104,7 +1118,7 @@ def _calculate_tech_debt_score(file_obj, symbols) -> int:
         score += 10
 
     # Changements fréquents (instabilité)
-    if file_obj.git_commits_30d and file_obj.git_commits_30d > 10:
+    if file_obj.commits_30d and file_obj.commits_30d > 10:
         score += 10
 
     return min(score, 100)
@@ -1117,6 +1131,7 @@ def _calculate_tech_debt_score(file_obj, symbols) -> int:
 def get_module_summary(
     db,
     module: str,
+    include_private: bool = False,
 ) -> dict[str, Any]:
     """
     Récupère un résumé complet d'un module (ensemble de fichiers).
@@ -1170,8 +1185,10 @@ def get_module_summary(
             SELECT kind, COUNT(*) as cnt
             FROM symbols
             WHERE file_id IN ({placeholders})
-            GROUP BY kind
         """
+        if not include_private:
+            symbols_query += " AND name NOT LIKE '\\_%' ESCAPE '\\'"
+        symbols_query += " GROUP BY kind"
         symbol_counts = db.fetch_all(symbols_query, tuple(file_ids))
 
         for row in symbol_counts:
