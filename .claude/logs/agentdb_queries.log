@@ -1,0 +1,18 @@
+[2025-12-07 23:31:18.762] [test-session] START list_modules 
+[2025-12-07 23:31:18.768] [test-session] END   list_modules (6ms, 247 bytes, OK)
+[2025-12-07 23:31:26.067] [analyzer-agent] START file_context (args: src/server/UDPServer.cpp)
+[2025-12-07 23:31:26.088] [analyzer-agent] END   file_context (21ms, 1609 bytes, OK)
+[2025-12-07 23:31:26.096] [security-agent] START error_history (args: src/server/UDPServer.cpp 365)
+[2025-12-07 23:31:26.107] [security-agent] END   error_history (12ms, 648 bytes, OK)
+[2025-12-07 23:31:26.115] [risk-agent] START symbol_callers (args: sendPacket)
+[2025-12-07 23:31:26.136] [risk-agent] END   symbol_callers (21ms, 677 bytes, OK)
+[2025-12-07 23:31:26.142] [test] ERROR: Unknown command: invalid_command
+[2025-12-07 23:43:59.762] [unknown] ERROR: Database not found at /home/simia/Dev/flow/.claude/agentdb/db.sqlite
+[2025-12-07 23:52:29.104] [test] START list_modules 
+[2025-12-07 23:52:29.110] [test] END   list_modules (6ms, 19 bytes, OK)
+[2025-12-07 23:52:30.711] [test] START list_critical_files 
+[2025-12-07 23:52:30.717] [test] END   list_critical_files (7ms, 26 bytes, OK)
+[2025-12-07 23:52:39.238] [analyzer] START file_context (args: src/test.cpp)
+[2025-12-07 23:52:39.243] [analyzer] END   file_context (5ms, FAILED: exit 1)
+[2025-12-07 23:52:40.325] [security] START error_history (args: src/test.cpp 90)
+[2025-12-07 23:52:40.337] [security] END   error_history (12ms, 266 bytes, OK)
