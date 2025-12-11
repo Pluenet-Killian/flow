@@ -6,3 +6,8 @@ main.c
 .claude/agentdb/db.sqlite-wal
 
 .claude/logs/*
+.claude/agentdb/db.sqlite.bak
+.claude/logs/agentdb_queries.log
+.claude/logs/bootstrap.log
+
+.claude/reports/*
