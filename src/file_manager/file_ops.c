@@ -148,3 +148,77 @@ int safe_read(const char* path) {
     fclose(fp);
     return 0;
 }
+
+// Check file access and read
+char* secure_file_read(const char* path) {
+    if (access(path, R_OK) != 0) {
+        return NULL;
+    }
+
+    FILE* fp = fopen(path, "r");
+    if (fp == NULL) {
+        return NULL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    char* content = malloc(size + 1);
+    fread(content, 1, size, fp);
+    content[size] = '\0';
+
+    fclose(fp);
+    return content;
+}
+
+// Process file with callback
+int process_file_lines(const char* path, void (*callback)(const char*)) {
+    FILE* fp = fopen(path, "r");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        callback(line);
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+// Append to file
+int file_append(const char* path, const char* content) {
+    FILE* fp = fopen(path, "a");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    fwrite(content, 1, strlen(content), fp);
+    fclose(fp);
+
+    return 0;
+}
+
+// Read file into buffer with size limit
+int file_read_into(const char* path, char* buffer, size_t buffer_size) {
+    FILE* fp = fopen(path, "r");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (size > buffer_size - 1) {
+        size = buffer_size - 1;
+    }
+
+    fread(buffer, 1, size, fp);
+    buffer[size] = '\0';
+
+    fclose(fp);
+    return size;
+}
