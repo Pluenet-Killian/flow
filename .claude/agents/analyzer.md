@@ -44,6 +44,35 @@ bash .claude/agentdb/query.sh list_modules                      # Liste des modu
 bash .claude/agentdb/query.sh list_critical_files               # Fichiers critiques
 ```
 
+## Gestion des erreurs AgentDB
+
+Chaque query peut retourner une erreur ou des données vides. Voici comment les gérer :
+
+| Situation | Détection | Action | Impact sur rapport |
+|-----------|-----------|--------|-------------------|
+| **DB inaccessible** | `"error"` dans JSON | Continuer sans AgentDB | Marquer `❌ ERROR` + pénalité -5 |
+| **Fichier non indexé** | `"file not found"` ou résultat vide | Utiliser grep/git comme fallback | Marquer `⚠️ NOT INDEXED` |
+| **Symbole introuvable** | Résultat vide | OK si fonction privée/nouvelle | Marquer `⚠️ EMPTY` |
+| **Query timeout** | Pas de réponse après 30s | Retry 1x, puis skip | Marquer `⚠️ TIMEOUT` |
+
+**Template de vérification** :
+```bash
+result=$(AGENTDB_CALLER="analyzer" bash .claude/agentdb/query.sh file_context "path/file.cpp")
+
+# Vérifier si erreur
+if echo "$result" | grep -q '"error"'; then
+    echo "AgentDB error - using fallback"
+    # Utiliser grep/git comme alternative
+fi
+
+# Vérifier si vide
+if [ "$result" = "{}" ] || [ "$result" = "[]" ] || [ -z "$result" ]; then
+    echo "No data - file may not be indexed"
+fi
+```
+
+**Règle** : Un agent ne doit JAMAIS échouer à cause d'AgentDB. Si AgentDB ne répond pas, continuer avec les outils de base (grep, git) et le signaler dans le rapport.
+
 ## Méthodologie OBLIGATOIRE
 
 ### Étape 1 : Identifier les fichiers modifiés
@@ -238,17 +267,19 @@ DEFAULT_TIMEOUT (src/core/Config.hpp:15) [MODIFIED]
 
 ## Calcul du Score (0-100)
 
+**Référence** : Les pénalités sont définies dans `.claude/config/agentdb.yaml` section `analysis.analyzer.penalties`
+
 ```
 Score = 100 - penalties
 
-Penalties :
-- Fichier critique modifié : -15 par fichier
-- Impact GLOBAL : -20
-- Impact MODULE : -10
-- Plus de 5 appelants par fonction : -5 par fonction
-- Plus de 10 appelants total : -10
-- Changement de signature publique : -10 par fonction
-- AgentDB vide (pas de données) : -5
+Pénalités (valeurs par défaut, voir config pour personnaliser) :
+- Fichier critique modifié : -15 par fichier (critical_file)
+- Impact GLOBAL : -20 (global_impact)
+- Impact MODULE : -10 (module_impact)
+- Plus de 5 appelants par fonction : -5 par fonction (callers_per_func_5)
+- Plus de 10 appelants total : -10 (total_callers_10)
+- Changement de signature publique : -10 par fonction (signature_change)
+- AgentDB vide (pas de données) : -5 (no_agentdb_data)
 ```
 
 ## Règles

@@ -41,6 +41,34 @@ bash .claude/agentdb/query.sh symbol_callers "funcName"             # Propagatio
 bash .claude/agentdb/query.sh list_critical_files                   # Fichiers sensibles
 ```
 
+## Gestion des erreurs AgentDB
+
+Chaque query peut retourner une erreur ou des données vides. Voici comment les gérer :
+
+| Situation | Détection | Action | Impact sur rapport |
+|-----------|-----------|--------|-------------------|
+| **DB inaccessible** | `"error"` dans JSON | Continuer sans AgentDB | Marquer `❌ ERROR` + pénalité -10 |
+| **Fichier non indexé** | `"file not found"` ou résultat vide | Scanner le code manuellement | Marquer `⚠️ NOT INDEXED` |
+| **Pas d'historique** | error_history vide | OK si projet nouveau | Marquer `⚠️ NO HISTORY` |
+| **Query timeout** | Pas de réponse après 30s | Retry 1x, puis skip | Marquer `⚠️ TIMEOUT` |
+
+**Template de vérification** :
+```bash
+result=$(AGENTDB_CALLER="security" bash .claude/agentdb/query.sh error_history "path/file.cpp" 365)
+
+# Vérifier si erreur
+if echo "$result" | grep -q '"error"'; then
+    echo "AgentDB error - scanning manually"
+fi
+
+# Vérifier si vide (OK pour error_history si projet nouveau)
+if [ "$result" = "[]" ] || [ -z "$result" ]; then
+    echo "No bug history - project may be new or error_history not populated"
+fi
+```
+
+**Règle CRITIQUE** : Pour la sécurité, l'absence de données AgentDB ne doit PAS empêcher le scan. Toujours scanner le code avec grep pour les patterns dangereux (strcpy, system, etc.) même si AgentDB est vide.
+
 ## Méthodologie OBLIGATOIRE
 
 ### Étape 1 : VÉRIFIER L'HISTORIQUE (CRITIQUE)
@@ -379,18 +407,20 @@ executeCommand (src/utils/Shell.cpp:34) [VULNERABLE: CWE-78]
 
 ## Calcul du Score (0-100)
 
+**Référence** : Les pénalités sont définies dans `.claude/config/agentdb.yaml` section `analysis.security.penalties`
+
 ```
 Score = 100 - penalties
 
-Penalties :
-- Vulnérabilité CRITICAL : -30 chacune
-- Vulnérabilité HIGH : -20 chacune
-- Vulnérabilité MEDIUM : -10 chacune
-- Vulnérabilité LOW : -5 chacune
-- RÉGRESSION détectée : -25 (en plus de la sévérité)
-- Fichier security_sensitive touché : -10
-- Pattern de sécurité violé : -5 par pattern
-- AgentDB error_history non consulté : -10
+Pénalités (valeurs par défaut, voir config pour personnaliser) :
+- Vulnérabilité CRITICAL : -30 chacune (critical)
+- Vulnérabilité HIGH : -20 chacune (high)
+- Vulnérabilité MEDIUM : -10 chacune (medium)
+- Vulnérabilité LOW : -5 chacune (low)
+- RÉGRESSION détectée : -25 (en plus de la sévérité) (regression)
+- Fichier security_sensitive touché : -10 (sensitive_file)
+- Pattern de sécurité violé : -5 par pattern (pattern_violated)
+- AgentDB error_history non consulté : 0 (no_error_history - pas de pénalité si DB vide)
 
 Minimum = 0 (ne pas aller en négatif)
 ```

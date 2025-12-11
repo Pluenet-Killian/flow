@@ -39,6 +39,15 @@ bash .claude/agentdb/query.sh list_modules                    # Liste modules
 bash .claude/agentdb/query.sh list_critical_files             # Fichiers critiques
 ```
 
+## Gestion des erreurs AgentDB
+
+| Situation | Détection | Action |
+|-----------|-----------|--------|
+| **DB inaccessible** | `"error"` dans JSON | Synthétiser uniquement les rapports des agents |
+| **Query vide** | Résultat vide | OK - les agents ont déjà collecté les données |
+
+**Note** : SYNTHESIS dépend principalement des rapports des autres agents, pas d'AgentDB directement. Les queries AgentDB sont optionnelles pour cross-vérification.
+
 ## Méthodologie OBLIGATOIRE
 
 ### Étape 1 : Extraire les JSON des rapports
@@ -134,13 +143,15 @@ if security.regressions > 0 and "regression" not in str(risk.factors):
 
 ### Étape 4 : Calculer le score global
 
+**Référence** : Pondérations dans `.claude/config/agentdb.yaml` section `analysis.weights`
+
 ```
-# Formule pondérée
+# Formule pondérée (valeurs par défaut, personnalisables via config)
 GLOBAL_SCORE = (
-    security.score * 0.35 +    # Sécurité = priorité maximale
-    risk.score * 0.25 +        # Risque global
-    reviewer.score * 0.25 +    # Qualité du code
-    analyzer.score * 0.15      # Impact (informatif)
+    security.score * 0.35 +    # security weight (priorité maximale)
+    risk.score * 0.25 +        # risk weight
+    reviewer.score * 0.25 +    # reviewer weight
+    analyzer.score * 0.15      # analyzer weight
 )
 
 # Pénalités globales
@@ -156,19 +167,24 @@ GLOBAL_SCORE = max(0, min(100, round(GLOBAL_SCORE)))
 
 ### Étape 5 : Déterminer le verdict
 
+**Référence** : Seuils de verdict dans `.claude/config/agentdb.yaml` section `analysis.verdicts`
+
 ```
+# Seuils par défaut (personnalisables via config)
+# approve: 80, review: 60, careful: 40, reject: 0
+
 # Règles de décision (ordre de priorité)
 if security.max_severity == "CRITICAL" or security.regressions > 0:
     verdict = "REJECT"
     emoji = "🔴"
     message = "Ne pas merger - problèmes critiques"
 
-elif security.max_severity == "HIGH" or risk.score < 60 or any(f.blocking for f in all_findings):
+elif security.max_severity == "HIGH" or risk.score < config.verdicts.review or any(f.blocking for f in all_findings):
     verdict = "CAREFUL"
     emoji = "🟠"
     message = "Review approfondie requise"
 
-elif reviewer.errors > 0 or risk.score < 80 or GLOBAL_SCORE < 70:
+elif reviewer.errors > 0 or risk.score < config.verdicts.approve or GLOBAL_SCORE < 70:
     verdict = "REVIEW"
     emoji = "🟡"
     message = "Review humaine recommandée"
@@ -180,6 +196,8 @@ else:
 ```
 
 ## Format de sortie OBLIGATOIRE
+
+**Exemple de référence** : Voir `.claude/reports/examples/GOLDEN_REPORT.md` pour un rapport complet.
 
 ```markdown
 # 📊 Rapport de Synthèse

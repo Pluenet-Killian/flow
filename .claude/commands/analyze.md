@@ -67,6 +67,59 @@ Garder uniquement les fichiers de code :
 - Extensions : `.c`, `.cpp`, `.h`, `.hpp`, `.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`
 - Ignorer : `.md`, `.txt`, `.json`, `.yaml`, `.yml`, `.lock`, images, etc.
 
+## ÉTAPE 1.5 : Récupérer le contexte Jira (optionnel)
+
+Si le MCP Jira est configuré, extraire les informations du ticket associé au commit.
+
+### Extraction automatique depuis le commit message
+
+Utilise l'outil MCP `mcp__jira__get_issue_from_text` avec le message du commit :
+
+```
+# Exemple de commit message : "[PROJ-123] Fix login bug"
+# L'outil extrait automatiquement PROJ-123 et récupère les infos du ticket
+```
+
+### Informations à récupérer
+
+Si un ticket est trouvé, extraire :
+- **summary** : Titre du ticket
+- **description** : Description complète
+- **acceptance_criteria** : Critères d'acceptation (si disponibles)
+- **type** : Bug, Story, Task, etc.
+- **priority** : Priorité du ticket
+- **status** : Statut actuel
+
+### Gestion des erreurs Jira
+
+| Situation | Action |
+|-----------|--------|
+| MCP Jira non configuré | Continuer sans contexte Jira |
+| Pas de ticket dans le commit | Continuer sans contexte Jira |
+| Ticket non trouvé (404) | Mentionner dans le rapport, continuer |
+| Erreur API Jira | Loguer l'erreur, continuer sans |
+
+**Important** : L'absence de contexte Jira ne doit JAMAIS bloquer l'analyse.
+
+### Intégration dans les prompts
+
+Si un ticket Jira est trouvé, ajouter cette section aux prompts des agents :
+
+```markdown
+**Contexte Jira** :
+- Ticket : {ticket_key}
+- Titre : {summary}
+- Type : {type}
+- Description : {description}
+- Acceptance Criteria : {acceptance_criteria}
+```
+
+Cette information aide les agents à :
+- **ANALYZER** : Vérifier que l'impact correspond au scope du ticket
+- **SECURITY** : Adapter le niveau de scrutiny selon le type (Bug vs Feature)
+- **REVIEWER** : Vérifier que le code répond aux acceptance criteria
+- **RISK** : Ajuster le risque selon la criticité du ticket
+
 ## ÉTAPE 2 : Préparer le contexte pour les agents
 
 Pour chaque fichier modifié, récupérer les informations de base :
@@ -79,65 +132,59 @@ git diff HEAD~1 -- "path/to/file.cpp"
 git diff HEAD~1 --stat -- "path/to/file.cpp"
 ```
 
-## ÉTAPE 3 : Lancer les agents dans l'ordre
+## ÉTAPE 3 : Lancer les agents
 
 ### Ordre d'exécution OBLIGATOIRE
 
 ```
-1. ANALYZER   ─────────────────┐
-                               │
-2. SECURITY   ─────────────────┼──> (peuvent être parallèles)
-                               │
-3. REVIEWER   ─────────────────┘
-       │
-       ▼
-4. RISK       (a besoin des résultats précédents)
-       │
-       ▼
-5. SYNTHESIS  (fusionne tout)
+┌─────────────────────────────────────────────────────────────────┐
+│                     PHASE 1 : PARALLÈLE                         │
+│                                                                  │
+│   ┌──────────┐   ┌──────────┐   ┌──────────┐                    │
+│   │ ANALYZER │   │ SECURITY │   │ REVIEWER │                    │
+│   └────┬─────┘   └────┬─────┘   └────┬─────┘                    │
+│        │              │              │                           │
+│        └──────────────┼──────────────┘                           │
+│                       ▼                                          │
+├─────────────────────────────────────────────────────────────────┤
+│                     PHASE 2 : SÉQUENTIEL                        │
+│                       ▼                                          │
+│                 ┌──────────┐                                     │
+│                 │   RISK   │  ← Reçoit les 3 rapports           │
+│                 └────┬─────┘                                     │
+│                      ▼                                          │
+│                ┌───────────┐                                     │
+│                │ SYNTHESIS │  ← Reçoit les 4 rapports           │
+│                └───────────┘                                     │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Pour chaque agent, utiliser le Task tool
+### PHASE 1 : Lancer ANALYZER, SECURITY, REVIEWER EN PARALLÈLE
 
-**IMPORTANT** : Chaque agent DOIT utiliser AgentDB. Vérifie dans chaque rapport la présence de la section "AgentDB Data Used".
+**CRITIQUE** : Tu DOIS lancer ces 3 agents **dans un seul message** avec **3 appels Task tool simultanés**.
 
-#### Agent 1 : ANALYZER
+Envoie **UN SEUL message** contenant **3 blocs Task tool** :
 
-```
-Utilise le Task tool avec :
-- subagent_type: "analyzer"
-- prompt: Contient les fichiers modifiés et demande d'analyser l'impact
+1. Task #1 : subagent_type="analyzer", prompt={prompt analyzer}
+2. Task #2 : subagent_type="security", prompt={prompt security}
+3. Task #3 : subagent_type="reviewer", prompt={prompt reviewer}
 
-L'agent DOIT appeler :
-- query.sh file_context pour chaque fichier
-- query.sh symbol_callers pour chaque fonction modifiée
-- query.sh file_impact pour chaque fichier
-```
+**NE PAS** attendre le résultat d'un agent avant de lancer les autres.
+**NE PAS** envoyer 3 messages séparés.
 
-#### Agent 2 : SECURITY
+Chaque agent DOIT utiliser AgentDB. Vérifie dans chaque rapport la présence de la section "AgentDB Data Used".
 
-```
-Utilise le Task tool avec :
-- subagent_type: "security"
-- prompt: Contient les fichiers modifiés et demande d'auditer la sécurité
+#### Agents Phase 1 (parallèles)
 
-L'agent DOIT appeler :
-- query.sh error_history pour vérifier les régressions
-- query.sh patterns category=security
-```
+| Agent | subagent_type | Query AgentDB obligatoires |
+|-------|---------------|---------------------------|
+| ANALYZER | `analyzer` | file_context, symbol_callers, file_impact |
+| SECURITY | `security` | error_history, patterns (category=security) |
+| REVIEWER | `reviewer` | patterns, file_metrics, architecture_decisions |
 
-#### Agent 3 : REVIEWER
+### PHASE 2 : Lancer RISK puis SYNTHESIS (séquentiel)
 
-```
-Utilise le Task tool avec :
-- subagent_type: "reviewer"
-- prompt: Contient les fichiers modifiés et demande une code review
-
-L'agent DOIT appeler :
-- query.sh patterns pour chaque fichier
-- query.sh file_metrics pour la complexité
-- query.sh architecture_decisions pour les ADRs
-```
+**Attendre** que les 3 agents de Phase 1 soient terminés, puis :
 
 #### Agent 4 : RISK
 
@@ -187,6 +234,8 @@ Après chaque agent, sauvegarder son rapport :
 ```
 
 ## ÉTAPE 6 : Produire le rapport final (REPORT.md)
+
+**Exemple de référence** : Voir `.claude/reports/examples/GOLDEN_REPORT.md` pour un rapport complet.
 
 Le rapport REPORT.md doit contenir :
 
@@ -267,12 +316,14 @@ Rapport complet : .claude/reports/{date}-{commit}/REPORT.md
 
 ## Verdicts possibles
 
+**Référence** : Seuils configurables dans `.claude/config/agentdb.yaml` section `analysis.verdicts`
+
 | Score | Verdict | Emoji | Signification |
 |-------|---------|-------|---------------|
-| 80-100 | APPROVE | 🟢 | Peut être mergé |
-| 60-79 | REVIEW | 🟡 | Review humaine recommandée |
-| 40-59 | CAREFUL | 🟠 | Review approfondie requise |
-| 0-39 | REJECT | 🔴 | Ne pas merger en l'état |
+| ≥80 | APPROVE | 🟢 | Peut être mergé |
+| ≥60 | REVIEW | 🟡 | Review humaine recommandée |
+| ≥40 | CAREFUL | 🟠 | Review approfondie requise |
+| <40 | REJECT | 🔴 | Ne pas merger en l'état |
 
 ### Règles de décision
 

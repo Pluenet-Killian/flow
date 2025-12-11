@@ -43,6 +43,34 @@ bash .claude/agentdb/query.sh search_symbols "pattern*" [kind]      # Chercher d
 bash .claude/agentdb/query.sh module_summary "module"               # Résumé du module
 ```
 
+## Gestion des erreurs AgentDB
+
+Chaque query peut retourner une erreur ou des données vides. Voici comment les gérer :
+
+| Situation | Détection | Action | Impact sur rapport |
+|-----------|-----------|--------|-------------------|
+| **DB inaccessible** | `"error"` dans JSON | Utiliser conventions standard | Marquer `❌ ERROR` + pénalité -5 |
+| **Pas de patterns** | patterns vide | Utiliser conventions du langage | Marquer `⚠️ NO PATTERNS` |
+| **Pas d'ADRs** | architecture_decisions vide | Skip ADR check | Marquer `⚠️ NO ADRs` |
+| **Métriques absentes** | file_metrics vide | Calculer manuellement si possible | Marquer `⚠️ NO METRICS` |
+
+**Template de vérification** :
+```bash
+result=$(AGENTDB_CALLER="reviewer" bash .claude/agentdb/query.sh patterns "path/file.cpp")
+
+# Vérifier si erreur
+if echo "$result" | grep -q '"error"'; then
+    echo "AgentDB error - using standard conventions"
+fi
+
+# Vérifier si vide
+if [ "$result" = "[]" ] || [ -z "$result" ]; then
+    echo "No patterns defined - using language defaults"
+fi
+```
+
+**Règle** : Si AgentDB ne contient pas de patterns, utiliser les conventions standard du langage (PEP8 pour Python, Google Style pour C++, etc.) et le mentionner dans le rapport.
+
 ## Méthodologie OBLIGATOIRE
 
 ### Étape 1 : Charger les patterns du projet
@@ -427,18 +455,20 @@ New code:
 
 ## Calcul du Score (0-100)
 
+**Référence** : Les pénalités sont définies dans `.claude/config/agentdb.yaml` section `analysis.reviewer.penalties`
+
 ```
 Score = 100 - penalties
 
-Penalties :
-- Issue ERROR : -15 chacune
-- Issue WARNING : -8 chacune
-- Issue INFO : -3 chacune
-- Pattern violé : -5 par pattern (en plus des issues)
-- ADR violé : -10 par ADR
-- Complexité max > 20 : -10
-- Documentation < 50% : -10
-- AgentDB patterns non chargés : -5
+Pénalités (valeurs par défaut, voir config pour personnaliser) :
+- Issue ERROR : -15 chacune (error)
+- Issue WARNING : -8 chacune (warning)
+- Issue INFO : -3 chacune (info)
+- Pattern violé : -5 par pattern (pattern_violated)
+- ADR violé : -10 par ADR (adr_violated)
+- Complexité max > seuil : -10 (high_complexity)
+- Documentation < 50% : -10 (low_documentation)
+- AgentDB patterns non chargés : -5 (no_patterns)
 
 Minimum = 0
 ```

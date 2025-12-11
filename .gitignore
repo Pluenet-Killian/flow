@@ -1,1 +1,8 @@
 *.pyc
+
+main.c
+.claude/agentdb/db.sqlite
+.claude/agentdb/db.sqlite-shm
+.claude/agentdb/db.sqlite-wal
+
+.claude/logs/*
