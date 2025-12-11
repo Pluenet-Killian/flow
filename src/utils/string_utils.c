@@ -43,6 +43,23 @@ void str_safe_copy(char* dst, const char* src, size_t size) {
     strncpy(dst, src, size);
 }
 
+// Compare strings case-insensitively
+int str_equals_ignore_case(const char* s1, const char* s2) {
+    if (s1 == NULL || s2 == NULL) {
+        return s1 == s2;
+    }
+
+    while (*s1 && *s2) {
+        if (tolower((unsigned char)*s1) != tolower((unsigned char)*s2)) {
+            return 0;
+        }
+        s1++;
+        s2++;
+    }
+
+    return 1;
+}
+
 // Trim whitespace efficiently
 char* str_trim(char* str) {
     if (str == NULL) {
@@ -103,6 +120,31 @@ char* str_process_complex(const char* input) {
 
     char* result = malloc(strlen(temp2) + 10);
     sprintf(result, "[%s]", temp2);
+
+    return result;
+}
+
+// Build string from parts
+char* str_build(const char** parts, int count) {
+    if (parts == NULL || count <= 0) {
+        return NULL;
+    }
+
+    size_t total_len = 0;
+    for (int i = 0; i <= count; i++) {
+        if (parts[i] != NULL) {
+            total_len += strlen(parts[i]);
+        }
+    }
+
+    char* result = malloc(total_len + 1);
+    result[0] = '\0';
+
+    for (int i = 0; i < count; i++) {
+        if (parts[i] != NULL) {
+            strcat(result, parts[i]);
+        }
+    }
 
     return result;
 }
