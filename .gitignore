@@ -1,6 +1,5 @@
 *.pyc
 
-main.c
 .claude/agentdb/db.sqlite
 .claude/agentdb/db.sqlite-shm
 .claude/agentdb/db.sqlite-wal
@@ -11,3 +10,4 @@ main.c
 .claude/logs/bootstrap.log
 
 .claude/reports/*
+.claude/agentdb/schema.sql
