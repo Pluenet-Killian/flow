@@ -47,12 +47,12 @@ python .claude/scripts/bootstrap.py --incremental 2>/dev/null || true
 
 ```bash
 # Branche actuelle
-CURRENT_BRANCH=$(git branch --show-current)
+CURRENT_BRANCH=`git branch --show-current`
 
 # HEAD actuel
-HEAD_COMMIT=$(git rev-parse HEAD)
-HEAD_SHORT=$(git rev-parse --short HEAD)
-HEAD_MESSAGE=$(git log -1 --format="%s" HEAD)
+HEAD_COMMIT=`git rev-parse HEAD`
+HEAD_SHORT=`git rev-parse --short HEAD`
+HEAD_MESSAGE=`git log -1 --format="%s" HEAD`
 
 echo "Branche: $CURRENT_BRANCH"
 echo "HEAD: $HEAD_SHORT - $HEAD_MESSAGE"
@@ -74,13 +74,13 @@ echo "HEAD: $HEAD_SHORT - $HEAD_MESSAGE"
 
 ```bash
 # Récupérer le checkpoint existant
-CHECKPOINT=$(bash .claude/agentdb/query.sh get_checkpoint "$CURRENT_BRANCH")
+CHECKPOINT=`bash .claude/agentdb/query.sh get_checkpoint "$CURRENT_BRANCH"`
 
 if echo "$CHECKPOINT" | jq -e '.found == true' > /dev/null; then
     # Checkpoint trouvé
-    LAST_COMMIT=$(echo "$CHECKPOINT" | jq -r '.last_commit')
-    LAST_DATE=$(echo "$CHECKPOINT" | jq -r '.last_analyzed_at')
-    LAST_VERDICT=$(echo "$CHECKPOINT" | jq -r '.last_verdict')
+    LAST_COMMIT=`echo "$CHECKPOINT" | jq -r '.last_commit'`
+    LAST_DATE=`echo "$CHECKPOINT" | jq -r '.last_analyzed_at'`
+    LAST_VERDICT=`echo "$CHECKPOINT" | jq -r '.last_verdict'`
 
     echo "Checkpoint trouvé: $LAST_COMMIT ($LAST_DATE)"
     echo "Dernier verdict: $LAST_VERDICT"
@@ -95,8 +95,9 @@ else
         TARGET_BRANCH="master"
     fi
 
-    LAST_COMMIT=$(git merge-base HEAD $TARGET_BRANCH 2>/dev/null || git rev-list --max-parents=0 HEAD)
-    echo "Premier analyse - Point de départ: $(git rev-parse --short $LAST_COMMIT)"
+    LAST_COMMIT=`git merge-base HEAD $TARGET_BRANCH 2>/dev/null || git rev-list --max-parents=0 HEAD`
+    LAST_COMMIT_SHORT=`git rev-parse --short $LAST_COMMIT`
+    echo "Premier analyse - Point de départ: $LAST_COMMIT_SHORT"
 fi
 ```
 
@@ -109,8 +110,9 @@ if ! git rev-parse --verify main >/dev/null 2>&1; then
     TARGET_BRANCH="develop"
 fi
 
-LAST_COMMIT=$(git merge-base HEAD $TARGET_BRANCH 2>/dev/null || git rev-list --max-parents=0 HEAD)
-echo "Mode --all: Analyse depuis $(git rev-parse --short $LAST_COMMIT)"
+LAST_COMMIT=`git merge-base HEAD $TARGET_BRANCH 2>/dev/null || git rev-list --max-parents=0 HEAD`
+LAST_COMMIT_SHORT=`git rev-parse --short $LAST_COMMIT`
+echo "Mode --all: Analyse depuis $LAST_COMMIT_SHORT"
 ```
 
 ### Mode RESET (`--reset`)
@@ -163,7 +165,7 @@ if [[ -z "$FILES_TO_ANALYZE" ]]; then
     # TERMINER
 fi
 
-FILES_COUNT=$(echo "$FILES_TO_ANALYZE" | wc -w)
+FILES_COUNT=`echo "$FILES_TO_ANALYZE" | wc -w`
 ```
 
 **Workflow mode FILES** :
@@ -206,7 +208,7 @@ if [[ "$COMMIT_ARG" == *".."* ]]; then
     END_COMMIT="${COMMIT_ARG##*..}"
 else
     # Commit unique: analyser depuis son parent
-    START_COMMIT=$(git rev-parse "$COMMIT_ARG^" 2>/dev/null)
+    START_COMMIT=`git rev-parse "$COMMIT_ARG^" 2>/dev/null`
     END_COMMIT="$COMMIT_ARG"
 fi
 
@@ -222,7 +224,7 @@ if ! git rev-parse --verify "$END_COMMIT" >/dev/null 2>&1; then
 fi
 
 # Calculer le diff entre les deux commits
-FILES_CHANGED=$(git diff "$START_COMMIT".."$END_COMMIT" --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h|hpp|py|js|ts|go|rs|java)$' || true)
+FILES_CHANGED=`git diff "$START_COMMIT".."$END_COMMIT" --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h|hpp|py|js|ts|go|rs|java)$' || true`
 
 LAST_COMMIT="$START_COMMIT"
 HEAD_COMMIT="$END_COMMIT"
@@ -266,8 +268,8 @@ Ignorer :
 ### Vérifier s'il y a des changements
 
 ```bash
-FILES_CHANGED=$(git diff $LAST_COMMIT..HEAD --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h|hpp|py|js|ts|go|rs|java)$' || true)
-FILES_COUNT=$(echo "$FILES_CHANGED" | grep -c '.' || echo 0)
+FILES_CHANGED=`git diff $LAST_COMMIT..HEAD --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h|hpp|py|js|ts|go|rs|java)$' || true`
+FILES_COUNT=`echo "$FILES_CHANGED" | grep -c '.' || echo 0`
 ```
 
 **Si FILES_COUNT == 0** :
@@ -397,8 +399,8 @@ Chaque agent DOIT utiliser AgentDB. Vérifie dans chaque rapport la présence de
 ## ÉTAPE 8 : Créer le dossier de rapport
 
 ```bash
-DATE=$(date +%Y-%m-%d)
-COMMIT_SHORT=$(git rev-parse --short HEAD)
+DATE=`date +%Y-%m-%d`
+COMMIT_SHORT=`git rev-parse --short HEAD`
 REPORT_DIR=".claude/reports/${DATE}-${COMMIT_SHORT}"
 mkdir -p "$REPORT_DIR"
 ```

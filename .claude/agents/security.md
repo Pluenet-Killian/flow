@@ -54,7 +54,7 @@ Chaque query peut retourner une erreur ou des données vides. Voici comment les 
 
 **Template de vérification** :
 ```bash
-result=$(AGENTDB_CALLER="security" bash .claude/agentdb/query.sh error_history "path/file.cpp" 365)
+result=`AGENTDB_CALLER="security" bash .claude/agentdb/query.sh error_history "path/file.cpp" 365`
 
 # Vérifier si erreur
 if echo "$result" | grep -q '"error"'; then
