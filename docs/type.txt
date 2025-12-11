@@ -1,0 +1,964 @@
+export type IssueStatus = 'pending' | 'in-progress' | 'done';
+export type IssueCategory = 'Security' | 'Reliability' | 'Maintainability';
+export type IssueSeverity = 'Blocker' | 'Critical' | 'Major' | 'Medium' | 'Minor' | 'Info';
+
+export interface Issue {
+  id: string;
+  title: string;
+  category: IssueCategory;
+  severity: IssueSeverity;
+  isBug: boolean;
+  file: string;
+  line: number;
+  status?: IssueStatus;
+}
+
+
+// Mock data pour les détails des issues
+const issueDetails: Record<string, {
+  where: string;
+  why: string;
+  how: string;
+}> = {
+  'i1': {
+    where: `## Location de la vulnérabilité
+
+La vulnérabilité SQL Injection se trouve dans le fichier \`src/database/queries.ts\` à la ligne 45.
+
+\`\`\`typescript
+// Code vulnérable
+const query = "SELECT * FROM users WHERE id = " + userId;
+db.execute(query);
+\`\`\`
+
+Cette requête construit directement une chaîne SQL avec des entrées utilisateur non validées.`,
+    
+    why: `## Pourquoi c'est un problème
+
+Les injections SQL sont l'une des vulnérabilités les plus dangereuses en sécurité applicative.
+
+### Impact potentiel
+
+\`\`\`mermaid
+graph TD
+    A[Attaquant] -->|Input malveillant| B[Application]
+    B -->|Requête SQL non sécurisée| C[Base de données]
+    C -->|Données sensibles| D[Fuite de données]
+    C -->|Modifications| E[Corruption de données]
+    C -->|Suppression| F[Perte de données]
+\`\`\`
+
+### Risques
+- **Accès non autorisé** aux données sensibles
+- **Modification ou suppression** de données
+- **Escalade de privilèges**
+- **Exécution de commandes** sur le serveur`,
+
+    how: `## Comment corriger
+
+### Solution recommandée
+
+Utilisez des **requêtes préparées** (prepared statements) pour empêcher les injections SQL.
+
+\`\`\`typescript
+// Code sécurisé
+const query = "SELECT * FROM users WHERE id = ?";
+db.execute(query, [userId]);
+\`\`\`
+
+### Étapes de correction
+
+\`\`\`mermaid
+graph LR
+    A[Identifier les requêtes] --> B[Utiliser des paramètres]
+    B --> C[Valider les entrées]
+    C --> D[Tester la sécurité]
+    D --> E[Déployer le correctif]
+\`\`\`
+
+### Bonnes pratiques
+1. Toujours utiliser des requêtes paramétrées
+2. Valider et assainir toutes les entrées utilisateur
+3. Utiliser un ORM qui gère automatiquement l'échappement
+4. Appliquer le principe du moindre privilège pour les comptes de base de données`
+  },
+  
+  'i2': {
+    where: `## Variable non utilisée
+
+La variable est déclarée dans \`src/utils/helpers.ts\` à la ligne 23.
+
+\`\`\`typescript
+function processData(input: string) {
+  const unusedVar = "hello"; // ← Variable jamais utilisée
+  return input.toUpperCase();
+}
+\`\`\``,
+
+    why: `## Impact sur la maintenabilité
+
+Les variables non utilisées diminuent la qualité du code.
+
+### Problèmes causés
+
+\`\`\`mermaid
+mindmap
+  root((Variables inutilisées))
+    Confusion
+      Code difficile à lire
+      Intention peu claire
+    Performance
+      Mémoire gaspillée
+      Temps de compilation
+    Maintenance
+      Code mort à gérer
+      Risque de bugs
+\`\`\``,
+
+    how: `## Correction
+
+Supprimez simplement la variable non utilisée :
+
+\`\`\`typescript
+function processData(input: string) {
+  return input.toUpperCase();
+}
+\`\`\`
+
+### Prévention
+
+Configurez votre linter pour détecter automatiquement ces problèmes :
+
+\`\`\`json
+{
+  "rules": {
+    "no-unused-vars": "error"
+  }
+}
+\`\`\``
+  },
+
+  'i3': {
+    where: `## Rejection non gérée au démarrage
+
+Le problème se trouve dans \`src/api/endpoints.ts\` à la ligne 78.
+
+\`\`\`typescript
+// Appelé au démarrage de l'application
+async function initializeApp() {
+  // ❌ Pas de try-catch, crashe l'app si l'API est down!
+  const config = await fetch('/api/config').then(r => r.json());
+
+  // L'app ne démarre pas sans cette config critique
+  window.APP_CONFIG = config;
+  startApplication(config);
+}
+
+// Exécuté immédiatement
+initializeApp();
+\`\`\``,
+
+    why: `## Pourquoi c'est un BUG (crash)
+
+Ce code **crashe l'application au démarrage** si l'API de config est indisponible.
+
+\`\`\`mermaid
+sequenceDiagram
+    participant Browser
+    participant App
+    participant API
+
+    Browser->>App: Chargement initial
+    App->>API: GET /api/config
+    API-->>App: Network Error (API down)
+    App->>App: ❌ Unhandled Promise Rejection
+    Note over App: APPLICATION CRASHÉE
+    App-->>Browser: Écran blanc / Erreur fatale
+\`\`\`
+
+### Impact
+- **Crash au démarrage** : l'application ne démarre jamais
+- **Écran blanc** pour tous les utilisateurs
+- **Impossible d'utiliser l'app** même pour des fonctions offline
+- **Erreur critique** en production
+
+### Différence avec un endpoint non-critique
+- ✅ Endpoint normal : l'app reste fonctionnelle si erreur
+- ❌ **Endpoint d'initialisation** : crash total de l'application`,
+
+    how: `## Solution avec gestion d'erreur
+
+\`\`\`typescript
+async function initializeApp() {
+  try {
+    const response = await fetch('/api/config');
+
+    if (!response.ok) {
+      throw new Error(\`Config API error: \${response.status}\`);
+    }
+
+    const config = await response.json();
+    window.APP_CONFIG = config;
+    startApplication(config);
+  } catch (error) {
+    console.error('Erreur initialisation:', error);
+
+    // Fallback: config par défaut pour permettre démarrage
+    window.APP_CONFIG = getDefaultConfig();
+    startApplication(window.APP_CONFIG);
+
+    // Afficher notification à l'utilisateur
+    showWarning('Mode dégradé: config serveur indisponible');
+  }
+}
+
+initializeApp();
+\`\`\`
+
+### Flux corrigé
+
+\`\`\`mermaid
+sequenceDiagram
+    participant Browser
+    participant App
+    participant API
+
+    Browser->>App: Chargement initial
+    App->>API: GET /api/config
+    API-->>App: Network Error
+    App->>App: ✅ Catch error
+    App->>App: Utiliser config par défaut
+    App-->>Browser: App démarre en mode dégradé
+    Note over Browser: Application fonctionnelle
+\`\`\`
+
+### Bonnes pratiques
+1. **Toujours** gérer les erreurs dans le code d'initialisation
+2. Prévoir une **config par défaut** ou un mode dégradé
+3. **Informer l'utilisateur** si mode dégradé activé
+4. **Logger** l'erreur pour debug`
+  },
+
+  'i4': {
+    where: `## Credentials en dur détectées
+
+Trouvées dans \`src/config/database.ts\` à la ligne 12.
+
+\`\`\`typescript
+const config = {
+  host: 'localhost',
+  user: 'admin',
+  password: 'P@ssw0rd123' // ��� JAMAIS en dur!
+};
+\`\`\``,
+
+    why: `## Risque de sécurité critique
+
+Les credentials en dur sont une faille de sécurité majeure.
+
+\`\`\`mermaid
+graph TB
+    A[Code source] -->|Push| B[Git Repository]
+    B -->|Public/Fuité| C[Attaquant]
+    C -->|Utilise credentials| D[Accès DB]
+    D -->|Contrôle total| E[Violation de données]
+\`\`\`
+
+### Conséquences
+- Accès non autorisé permanent
+- Violation de données RGPD
+- Compromission totale du système`,
+
+    how: `## Utiliser des variables d'environnement
+
+\`\`\`typescript
+// .env (ne jamais commiter!)
+DB_HOST=localhost
+DB_USER=admin
+DB_PASSWORD=P@ssw0rd123
+
+// config.ts
+const config = {
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD
+};
+\`\`\`
+
+### Checklist de sécurité
+- [ ] Déplacer vers variables d'environnement
+- [ ] Ajouter .env au .gitignore
+- [ ] Révoquer les anciens credentials
+- [ ] Utiliser un gestionnaire de secrets en production`
+  },
+
+  'i5': {
+    where: `## Fonction trop complexe
+
+Dans \`src/services/validation.ts\` à la ligne 156.
+
+\`\`\`typescript
+function validateForm(data: any) {
+  // 150 lignes de code avec une complexité cyclomatique de 45
+  if (data.email) {
+    if (data.email.includes('@')) {
+      if (data.password) {
+        if (data.password.length > 8) {
+          // ... encore 140 lignes
+        }
+      }
+    }
+  }
+}
+\`\`\``,
+
+    why: `## Impact sur la maintenabilité
+
+\`\`\`mermaid
+graph LR
+    A[Complexité élevée] --> B[Difficile à tester]
+    A --> C[Bugs cachés]
+    A --> D[Maintenance coûteuse]
+    A --> E[Difficile à comprendre]
+\`\`\`
+
+Une fonction complexe est :
+- Plus difficile à déboguer
+- Plus sujette aux bugs
+- Impossible à réutiliser`,
+
+    how: `## Refactorisation recommandée
+
+Divisez en fonctions plus petites :
+
+\`\`\`typescript
+// Fonctions spécialisées
+function validateEmail(email: string): boolean {
+  return email.includes('@') && email.includes('.');
+}
+
+function validatePassword(password: string): boolean {
+  return password.length >= 8;
+}
+
+// Fonction principale simplifiée
+function validateForm(data: FormData) {
+  return {
+    email: validateEmail(data.email),
+    password: validatePassword(data.password)
+  };
+}
+\`\`\`
+
+Chaque fonction a maintenant une seule responsabilité (principe SOLID).`
+  },
+
+  'i6': {
+    where: `## Déréférencement de pointeur null
+
+Dans \`src/auth/session.ts\` à la ligne 89.
+
+\`\`\`typescript
+async function getUserProfile(sessionId: string) {
+  const user = await getUserFromSession(sessionId);
+
+  // ❌ CRASH si user est null!
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email
+  };
+}
+\`\`\`
+
+Ce code crashe l'application si \`getUserFromSession\` retourne \`null\`.`,
+
+    why: `## Pourquoi c'est un BUG (crash)
+
+Ce problème provoque un **crash immédiat** de l'application.
+
+\`\`\`mermaid
+sequenceDiagram
+    participant Client
+    participant App
+    participant DB
+
+    Client->>App: GET /profile
+    App->>DB: getUserFromSession("invalid")
+    DB-->>App: null
+    App->>App: ❌ TypeError: Cannot read 'id' of null
+    App-->>Client: 500 Internal Server Error
+    Note over App: APPLICATION CRASHÉE
+\`\`\`
+
+### Impact
+- **Crash immédiat** de l'application
+- Expérience utilisateur dégradée
+- Possible perte de données en cours de traitement
+- Erreur 500 renvoyée au client`,
+
+    how: `## Correction avec vérification null
+
+\`\`\`typescript
+async function getUserProfile(sessionId: string) {
+  const user = await getUserFromSession(sessionId);
+
+  // ✅ Vérification avant accès
+  if (!user) {
+    throw new SessionExpiredError('Session invalide ou expirée');
+  }
+
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email
+  };
+}
+\`\`\`
+
+### Alternative avec optional chaining
+
+\`\`\`typescript
+async function getUserProfile(sessionId: string) {
+  const user = await getUserFromSession(sessionId);
+
+  return {
+    id: user?.id ?? null,
+    name: user?.name ?? 'Anonyme',
+    email: user?.email ?? ''
+  };
+}
+\`\`\`
+
+### Bonnes pratiques
+1. Toujours vérifier les valeurs nullables avant accès
+2. Utiliser TypeScript strict mode (\`strictNullChecks\`)
+3. Définir des types explicites pour les retours nullable`
+  },
+
+  'i7': {
+    where: `## Validation de mot de passe faible
+
+Dans \`src/auth/validators.ts\` à la ligne 34.
+
+\`\`\`typescript
+function isValidPassword(password: string): boolean {
+  return password.length >= 4; // Trop faible!
+}
+\`\`\``,
+
+    why: `## Risque de sécurité
+
+Une validation trop permissive expose les utilisateurs aux attaques.
+
+\`\`\`mermaid
+graph TD
+    A[Mot de passe faible] --> B[Attaque par force brute]
+    A --> C[Attaque par dictionnaire]
+    B --> D[Compte compromis]
+    C --> D
+    D --> E[Données volées]
+\`\`\`
+
+### Statistiques
+- Un mot de passe de 4 caractères : **craqué en secondes**
+- Un mot de passe de 8+ caractères avec complexité : **années de calcul**`,
+
+    how: `## Validation renforcée
+
+\`\`\`typescript
+function isValidPassword(password: string): boolean {
+  const minLength = 8;
+  const hasUppercase = /[A-Z]/.test(password);
+  const hasLowercase = /[a-z]/.test(password);
+  const hasNumber = /[0-9]/.test(password);
+  const hasSpecial = /[!@#$%^&*]/.test(password);
+
+  return password.length >= minLength
+    && hasUppercase
+    && hasLowercase
+    && hasNumber
+    && hasSpecial;
+}
+\`\`\`
+
+### Recommandations OWASP
+- Minimum 8 caractères
+- Mélange majuscules/minuscules
+- Au moins un chiffre
+- Au moins un caractère spécial`
+  },
+
+  'i8': {
+    where: `## API dépréciée
+
+Dans \`src/components/Chart.tsx\` à la ligne 34.
+
+\`\`\`typescript
+// ⚠️ componentWillMount est déprécié depuis React 16.3
+componentWillMount() {
+  this.fetchData();
+}
+\`\`\``,
+
+    why: `## Impact sur la maintenabilité
+
+\`\`\`mermaid
+graph LR
+    A[API dépréciée] --> B[Warnings en console]
+    A --> C[Incompatibilité future]
+    A --> D[Dette technique]
+\`\`\`
+
+- Les APIs dépréciées seront **supprimées** dans les futures versions
+- Risque de **bugs** lors des mises à jour React
+- Code non conforme aux **bonnes pratiques**`,
+
+    how: `## Migration vers les hooks
+
+\`\`\`typescript
+// ✅ Utiliser useEffect à la place
+function Chart() {
+  useEffect(() => {
+    fetchData();
+  }, []); // Exécuté au montage
+
+  return <div>...</div>;
+}
+\`\`\`
+
+Ou avec un class component :
+
+\`\`\`typescript
+// ✅ componentDidMount au lieu de componentWillMount
+componentDidMount() {
+  this.fetchData();
+}
+\`\`\``
+  },
+
+  'i9': {
+    where: `## Console.log en production
+
+Dans \`src/utils/debug.ts\` à la ligne 12.
+
+\`\`\`typescript
+export function processData(data: any) {
+  console.log('Processing:', data); // ❌ À supprimer
+  console.log('User data:', data.user); // ❌ Fuite de données!
+  return transform(data);
+}
+\`\`\``,
+
+    why: `## Problèmes de sécurité et performance
+
+- **Fuite d'informations** sensibles dans la console
+- **Impact performance** (I/O bloquant)
+- **Pollution** des logs de production
+- Non professionnel pour les utilisateurs`,
+
+    how: `## Utiliser un logger conditionnel
+
+\`\`\`typescript
+const isDev = process.env.NODE_ENV === 'development';
+
+export function processData(data: any) {
+  if (isDev) {
+    console.log('Processing:', data);
+  }
+  return transform(data);
+}
+\`\`\`
+
+### Ou configurer ESLint
+
+\`\`\`json
+{
+  "rules": {
+    "no-console": "error"
+  }
+}
+\`\`\``
+  },
+
+  'i10': {
+    where: `## Contournement d'authentification
+
+Dans \`src/auth/middleware.ts\` à la ligne 56.
+
+\`\`\`typescript
+function authMiddleware(req, res, next) {
+  const token = req.headers.authorization;
+
+  // ❌ Bypass si le header est vide!
+  if (!token) {
+    return next(); // Laisse passer sans vérification
+  }
+
+  verifyToken(token);
+  next();
+}
+\`\`\``,
+
+    why: `## Vulnérabilité critique
+
+\`\`\`mermaid
+graph TD
+    A[Attaquant] -->|Requête sans token| B[Middleware]
+    B -->|next sans vérification| C[Route protégée]
+    C -->|Accès non autorisé| D[Données sensibles]
+\`\`\`
+
+### Impact
+- **Accès non autorisé** à toutes les routes protégées
+- **Élévation de privilèges** possible
+- **Violation de données** RGPD`,
+
+    how: `## Correction du middleware
+
+\`\`\`typescript
+function authMiddleware(req, res, next) {
+  const token = req.headers.authorization;
+
+  // ✅ Rejeter si pas de token
+  if (!token) {
+    return res.status(401).json({ error: 'Token requis' });
+  }
+
+  try {
+    const decoded = verifyToken(token);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Token invalide' });
+  }
+}
+\`\`\``
+  },
+
+  'i11': {
+    where: `## Sanitization manquante
+
+Dans \`src/auth/login.ts\` à la ligne 23.
+
+\`\`\`typescript
+async function login(username: string, password: string) {
+  // ❌ Entrées non validées directement utilisées
+  const query = \`SELECT * FROM users WHERE username = '\${username}'\`;
+  const user = await db.query(query);
+  // ...
+}
+\`\`\``,
+
+    why: `## Vulnérabilité d'injection
+
+Sans sanitization, un attaquant peut injecter du code malveillant.
+
+### Exemple d'attaque
+\`\`\`
+username: admin' OR '1'='1
+\`\`\`
+
+Résultat : accès à tous les comptes.`,
+
+    how: `## Utiliser des requêtes préparées
+
+\`\`\`typescript
+async function login(username: string, password: string) {
+  // ✅ Requête préparée
+  const query = 'SELECT * FROM users WHERE username = ?';
+  const user = await db.query(query, [username]);
+  // ...
+}
+\`\`\`
+
+### Validation additionnelle
+
+\`\`\`typescript
+import { z } from 'zod';
+
+const loginSchema = z.object({
+  username: z.string().min(3).max(50).regex(/^[a-zA-Z0-9_]+$/),
+  password: z.string().min(8)
+});
+\`\`\``
+  },
+
+  'i12': {
+    where: `## Composant trop large
+
+Dans \`src/components/Dashboard.tsx\` - 450 lignes de code.
+
+\`\`\`typescript
+function Dashboard() {
+  // 50 états différents
+  const [user, setUser] = useState();
+  const [data, setData] = useState();
+  const [filters, setFilters] = useState();
+  // ... 47 autres états
+
+  // 20 fonctions handler
+  // 15 useEffect
+  // 300 lignes de JSX
+}
+\`\`\``,
+
+    why: `## Impact sur la maintenabilité
+
+- **Difficile à comprendre** : trop de responsabilités
+- **Difficile à tester** : dépendances multiples
+- **Difficile à réutiliser** : composant monolithique
+- **Performance** : re-renders inutiles`,
+
+    how: `## Diviser en composants plus petits
+
+\`\`\`typescript
+// Dashboard.tsx - Composant principal
+function Dashboard() {
+  return (
+    <DashboardProvider>
+      <DashboardHeader />
+      <DashboardFilters />
+      <DashboardContent />
+      <DashboardFooter />
+    </DashboardProvider>
+  );
+}
+
+// DashboardHeader.tsx
+function DashboardHeader() {
+  const { user } = useDashboard();
+  return <header>...</header>;
+}
+\`\`\`
+
+Chaque composant a une seule responsabilité.`
+  },
+
+  'i15': {
+    where: `## Division par zéro
+
+Dans \`src/security/rateLimiter.ts\` à la ligne 42.
+
+\`\`\`typescript
+function calculateRate(requests: number, windowMs: number) {
+  // ❌ CRASH si windowMs est 0!
+  return requests / windowMs * 1000;
+}
+
+// Appelé avec une config incorrecte
+const rate = calculateRate(100, config.window); // config.window = 0
+\`\`\``,
+
+    why: `## Pourquoi c'est un BUG (crash)
+
+La division par zéro provoque un **comportement indéfini** ou un **crash**.
+
+\`\`\`mermaid
+graph TD
+    A[config.window = 0] --> B[calculateRate appelé]
+    B --> C[Division par 0]
+    C --> D[Infinity ou NaN]
+    D --> E[Comportement imprévisible]
+    E --> F[Crash ou boucle infinie]
+\`\`\`
+
+### En JavaScript
+- \`100 / 0 = Infinity\`
+- Mais les calculs suivants peuvent crasher
+- Ou créer des boucles infinies`,
+
+    how: `## Validation avant division
+
+\`\`\`typescript
+function calculateRate(requests: number, windowMs: number): number {
+  // ✅ Vérification préalable
+  if (windowMs <= 0) {
+    throw new Error('windowMs doit être supérieur à 0');
+  }
+
+  return requests / windowMs * 1000;
+}
+\`\`\`
+
+### Ou valeur par défaut
+
+\`\`\`typescript
+function calculateRate(requests: number, windowMs: number): number {
+  const safeWindow = windowMs > 0 ? windowMs : 1000; // Défaut: 1 seconde
+  return requests / safeWindow * 1000;
+}
+\`\`\``
+  },
+
+  'i16': {
+    where: `## Promise rejection non gérée
+
+Dans \`src/services/auth.ts\` à la ligne 67.
+
+\`\`\`typescript
+async function authenticateUser(credentials: Credentials) {
+  // ❌ Pas de try-catch, crash si l'API échoue!
+  const response = await fetch('/api/auth', {
+    method: 'POST',
+    body: JSON.stringify(credentials)
+  });
+
+  const data = await response.json();
+  return data.token;
+}
+\`\`\``,
+
+    why: `## Pourquoi c'est un BUG (crash)
+
+Une rejection non gérée **crashe l'application Node.js**.
+
+\`\`\`mermaid
+sequenceDiagram
+    participant App
+    participant API
+
+    App->>API: POST /api/auth
+    API-->>App: Network Error
+    App->>App: ❌ Unhandled Promise Rejection
+    Note over App: CRASH - Process terminé
+\`\`\`
+
+### Depuis Node.js 15
+Les rejections non gérées **terminent le processus** par défaut.`,
+
+    how: `## Ajouter gestion d'erreur
+
+\`\`\`typescript
+async function authenticateUser(credentials: Credentials) {
+  try {
+    const response = await fetch('/api/auth', {
+      method: 'POST',
+      body: JSON.stringify(credentials)
+    });
+
+    if (!response.ok) {
+      throw new AuthError(\`HTTP \${response.status}\`);
+    }
+
+    const data = await response.json();
+    return data.token;
+  } catch (error) {
+    console.error('Erreur authentification:', error);
+    throw new AuthError('Authentification échouée');
+  }
+}
+\`\`\`
+
+### Handler global (filet de sécurité)
+
+\`\`\`typescript
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection:', reason);
+  // Logger mais ne pas crasher en prod
+});
+\`\`\``
+  },
+
+  'i17': {
+    where: `## Nombres magiques
+
+Dans \`src/validation/rules.ts\` à la ligne 23.
+
+\`\`\`typescript
+function validateAge(age: number): boolean {
+  return age >= 13 && age <= 120; // Que signifient 13 et 120?
+}
+
+function calculateDiscount(total: number): number {
+  if (total > 100) return total * 0.1;  // 100? 0.1?
+  if (total > 50) return total * 0.05;  // 50? 0.05?
+  return 0;
+}
+\`\`\``,
+
+    why: `## Impact sur la maintenabilité
+
+Les nombres magiques rendent le code :
+- **Difficile à comprendre** : que signifie 13?
+- **Difficile à maintenir** : changement à plusieurs endroits
+- **Source d'erreurs** : incohérences possibles`,
+
+    how: `## Utiliser des constantes nommées
+
+\`\`\`typescript
+const VALIDATION = {
+  MIN_AGE: 13,        // Âge minimum COPPA
+  MAX_AGE: 120,       // Âge maximum raisonnable
+} as const;
+
+const DISCOUNT = {
+  PREMIUM_THRESHOLD: 100,
+  PREMIUM_RATE: 0.10,      // 10%
+  STANDARD_THRESHOLD: 50,
+  STANDARD_RATE: 0.05,     // 5%
+} as const;
+
+function validateAge(age: number): boolean {
+  return age >= VALIDATION.MIN_AGE && age <= VALIDATION.MAX_AGE;
+}
+
+function calculateDiscount(total: number): number {
+  if (total > DISCOUNT.PREMIUM_THRESHOLD) {
+    return total * DISCOUNT.PREMIUM_RATE;
+  }
+  if (total > DISCOUNT.STANDARD_THRESHOLD) {
+    return total * DISCOUNT.STANDARD_RATE;
+  }
+  return 0;
+}
+\`\`\``
+  },
+
+  'i18': {
+    where: `## Documentation obsolète
+
+Dans \`README.md\` à la ligne 45.
+
+\`\`\`markdown
+## Installation
+
+npm install  # ❌ Devrait être pnpm install
+npm start    # ❌ Devrait être npm run dev
+
+## API
+
+GET /api/users  # ❌ Endpoint supprimé en v1.5
+\`\`\``,
+
+    why: `## Impact sur l'équipe
+
+- **Nouveaux développeurs** perdus
+- **Temps perdu** à chercher la bonne info
+- **Erreurs** lors du setup
+- **Frustration** de l'équipe`,
+
+    how: `## Mettre à jour la documentation
+
+\`\`\`markdown
+## Installation
+
+\\\`\\\`\\\`bash
+pnpm install
+pnpm run dev
+\\\`\\\`\\\`
+
+## API (v2.0)
+
+| Endpoint | Description |
+|----------|-------------|
+| GET /api/v2/users | Liste des utilisateurs |
+| POST /api/v2/auth | Authentification |
+\`\`\`
+
+### Bonnes pratiques
+- Mettre à jour la doc avec chaque PR
+- Utiliser des outils de génération (TypeDoc, Swagger)
+- Versionner la documentation`
+  }
+};

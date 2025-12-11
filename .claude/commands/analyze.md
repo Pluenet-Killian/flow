@@ -22,6 +22,26 @@ $ARGUMENTS
 
 ---
 
+## ÉTAPE 0 : Mettre à jour AgentDB (incrémental)
+
+**Avant toute analyse, s'assurer que la base AgentDB est à jour avec les derniers fichiers.**
+
+```bash
+# Mettre à jour AgentDB de manière incrémentale
+# Cela ne réindexe que les fichiers modifiés depuis le dernier indexage
+python .claude/scripts/bootstrap.py --incremental 2>/dev/null || true
+```
+
+**Comportement** :
+- Si la base n'existe pas : affiche un avertissement mais continue (l'analyse fonctionnera sans AgentDB)
+- Si aucun changement : retourne instantanément "Base already up to date"
+- Si des fichiers ont changé : les réindexe en quelques secondes
+- En cas d'erreur : continue l'analyse (AgentDB est optionnel)
+
+**Important** : Cette étape est silencieuse en cas d'erreur pour ne pas bloquer l'analyse.
+
+---
+
 ## ÉTAPE 1 : Déterminer le mode d'analyse
 
 ### Récupérer le contexte Git
@@ -574,6 +594,7 @@ FORMAT DE SORTIE OBLIGATOIRE : Utilise le format défini dans .claude/agents/syn
 
 Maintenant, exécute l'analyse en suivant les étapes ci-dessus.
 
+0. Mets à jour AgentDB (`python .claude/scripts/bootstrap.py --incremental`)
 1. Parse les arguments ($ARGUMENTS)
 2. Détermine le mode (incremental, full, reset, files, commit)
 3. Si mode == reset : mets à jour le checkpoint et TERMINE
