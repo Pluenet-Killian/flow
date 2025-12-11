@@ -125,12 +125,15 @@ Où les pénalités sont calculées comme suit :
 
 ## Méthodologie OBLIGATOIRE
 
-### Étape 1 : Identifier les fichiers modifiés
-```bash
-git diff HEAD~1 --name-status
-```
+### Pré-requis : Utiliser le contexte fourni
 
-### Étape 2 : Pour CHAQUE fichier, collecter les données AgentDB
+**IMPORTANT** : Tu reçois le contexte depuis le prompt de `/analyze` qui inclut :
+- La liste des fichiers modifiés (entre LAST_COMMIT et HEAD)
+- Les résultats des agents ANALYZER, SECURITY, REVIEWER
+
+Ne fais PAS `git diff HEAD~1` - utilise la liste de fichiers fournie dans le prompt.
+
+### Étape 1 : Pour CHAQUE fichier de la liste fournie, collecter les données AgentDB
 
 ```bash
 # OBLIGATOIRE : Criticité

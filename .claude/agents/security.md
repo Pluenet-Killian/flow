@@ -71,10 +71,19 @@ fi
 
 ## Méthodologie OBLIGATOIRE
 
+### Pré-requis : Utiliser le contexte fourni
+
+**IMPORTANT** : Tu reçois le contexte du diff depuis le prompt de `/analyze`. Le prompt te fournit :
+- La liste des fichiers modifiés (entre LAST_COMMIT et HEAD)
+- Le type d'analyse (diff unifié)
+
+Utilise cette liste pour itérer sur les fichiers, ne fais PAS ton propre `git diff HEAD~1`.
+
 ### Étape 1 : VÉRIFIER L'HISTORIQUE (CRITIQUE)
 
 ```bash
 # OBLIGATOIRE EN PREMIER : Récupérer les bugs passés sur 365 jours
+# Pour CHAQUE fichier de la liste fournie dans le prompt
 AGENTDB_CALLER="security" bash .claude/agentdb/query.sh error_history "path/to/file.cpp" 365
 ```
 

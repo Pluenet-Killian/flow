@@ -75,10 +75,19 @@ fi
 
 ## Méthodologie OBLIGATOIRE
 
-### Étape 1 : Identifier les fichiers modifiés
+### Étape 1 : Utiliser le contexte fourni
+
+**IMPORTANT** : Tu reçois le contexte du diff depuis le prompt de `/analyze`. Ne fais PAS `git diff HEAD~1`.
+
+Le prompt te fournit :
+- La liste des fichiers modifiés
+- Le diff résumé (--stat)
+- Les commits entre LAST_COMMIT et HEAD (qui peut être > 1 commit)
+
+Si tu as besoin du diff détaillé d'un fichier :
 ```bash
-git diff HEAD~1 --name-status
-git diff HEAD~1 --stat
+# Utiliser les références fournies dans le prompt
+git diff {LAST_COMMIT}..{HEAD} -- "path/to/file.cpp"
 ```
 
 ### Étape 2 : Pour CHAQUE fichier modifié, appeler AgentDB
@@ -96,7 +105,8 @@ AGENTDB_CALLER="analyzer" bash .claude/agentdb/query.sh file_impact "path/to/fil
 ### Étape 3 : Identifier les fonctions modifiées
 ```bash
 # Obtenir le diff détaillé pour voir les fonctions touchées
-git diff HEAD~1 -U5 "path/to/file.cpp"
+# Utiliser les références LAST_COMMIT et HEAD fournies dans le prompt
+git diff {LAST_COMMIT}..{HEAD} -U5 "path/to/file.cpp"
 ```
 
 ### Étape 4 : Pour CHAQUE fonction modifiée, trouver les appelants

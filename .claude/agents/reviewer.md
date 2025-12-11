@@ -120,12 +120,16 @@ AGENTDB_CALLER="reviewer" bash .claude/agentdb/query.sh search_symbols "*Handler
 
 ### Étape 5 : Lire et analyser le code
 
+**IMPORTANT** : Tu reçois le contexte du diff depuis le prompt de `/analyze`. Le prompt te fournit :
+- La liste des fichiers modifiés (entre LAST_COMMIT et HEAD)
+- Les références LAST_COMMIT et HEAD
+
 ```bash
 # Lire le fichier modifié
 cat path/to/file.cpp
 
-# Voir le diff si disponible
-git diff HEAD~1 path/to/file.cpp
+# Voir le diff en utilisant les références fournies dans le prompt
+git diff {LAST_COMMIT}..{HEAD} -- path/to/file.cpp
 ```
 
 ## Catégories de Review
