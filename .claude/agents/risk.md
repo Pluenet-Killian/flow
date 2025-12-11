@@ -260,31 +260,51 @@ Mais cap à 58 car pas de régression et pas de vuln CRITICAL
 
 **Analyse** : Ce commit est plus risqué que la moyenne du projet (score 58 vs 72). Les principaux facteurs sont le fichier critique touché et l'absence de tests.
 
+### Sévérités utilisées (format site web)
+
+| Sévérité | Description |
+|----------|-------------|
+| **Blocker** | Bloque le déploiement |
+| **Critical** | Risque très élevé |
+| **Major** | Risque significatif |
+| **Medium** | Risque modéré |
+| **Minor** | Risque faible |
+| **Info** | Information |
+
 ### Facteurs de Risque Principaux
 
 #### 🔴 Risque #1 : Fichier critique sans tests (-30 combiné)
 
+- **Sévérité** : Critical
+- **Catégorie** : Reliability
 - **Fichier** : src/server/UDPServer.cpp
 - **Problème** : Marqué `is_critical` mais `has_tests=false`
 - **Impact** : Modifications difficiles à valider
 - **Mitigation** : Ajouter tests unitaires (+10 points potentiel)
 - **Effort** : ~2h
+- **isBug** : ❌ Non
 
 #### 🟠 Risque #2 : Complexité élevée (-5)
 
+- **Sévérité** : Major
+- **Catégorie** : Maintainability
 - **Fichier** : src/server/UDPServer.cpp
 - **Problème** : complexity_max=18 (seuil=15)
 - **Impact** : Code difficile à maintenir et tester
 - **Mitigation** : Refactorer la fonction concernée
 - **Effort** : ~1h
+- **isBug** : ❌ Non
 
 #### 🟡 Risque #3 : Impact large (-5)
 
+- **Sévérité** : Medium
+- **Catégorie** : Reliability
 - **Fichier** : src/server/UDPServer.cpp
 - **Problème** : 7 fichiers dépendent de ce fichier
 - **Impact** : Changements peuvent casser d'autres modules
 - **Mitigation** : Tester les intégrations
 - **Effort** : ~30min
+- **isBug** : ❌ Non
 
 ### Actions de Mitigation
 
@@ -344,18 +364,24 @@ Mais cap à 58 car pas de régression et pas de vuln CRITICAL
   "findings": [
     {
       "id": "RISK-001",
-      "severity": "HIGH",
+      "severity": "Critical",
+      "category": "Reliability",
+      "isBug": false,
       "type": "missing_tests",
       "file": "src/server/UDPServer.cpp",
+      "line": 1,
       "message": "Fichier critique sans tests",
       "blocking": false,
       "mitigation": "Ajouter tests unitaires"
     },
     {
       "id": "RISK-002",
-      "severity": "MEDIUM",
+      "severity": "Major",
+      "category": "Maintainability",
+      "isBug": false,
       "type": "complexity",
       "file": "src/server/UDPServer.cpp",
+      "line": 145,
       "message": "Complexité élevée (18 > 15)",
       "blocking": false,
       "mitigation": "Refactorer la fonction"

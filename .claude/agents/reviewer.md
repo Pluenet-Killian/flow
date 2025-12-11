@@ -225,14 +225,27 @@ if (timeout > TIMEOUT_MS) { ... }
 | Documentation | 80% | 75% | > 80% | ❌ FAIL |
 | Functions | 12 | 14 | - | - |
 
+### Sévérités utilisées (format site web)
+
+| Sévérité | Description |
+|----------|-------------|
+| **Blocker** | Bloque le déploiement |
+| **Critical** | Erreur grave nécessitant correction immédiate |
+| **Major** | Impact significatif sur la qualité |
+| **Medium** | Impact modéré |
+| **Minor** | Impact faible |
+| **Info** | Information, suggestion |
+
 ### Issues
 
-#### 🔴 [ERROR] REV-001 : Fonction trop complexe
+#### 🔴 [Critical] REV-001 : Fonction trop complexe
 
+- **Catégorie** : Maintainability
 - **Fichier** : src/server/UDPServer.cpp:145-210
 - **Fonction** : `processMultipleRequests()`
 - **Pattern violé** : complexity (max=25, seuil=20)
 - **Bloquant** : Oui
+- **isBug** : ❌ Non (pas de crash, mais difficile à maintenir)
 
 **Code actuel** (65 lignes, complexité 25) :
 ```cpp
@@ -277,10 +290,12 @@ bool validateRequest(const Request& req) {
 - **Temps estimé** : ~20 min
 - **Bénéfice** : Complexité réduite de 25 à 5
 
-#### 🟠 [WARNING] REV-002 : Magic number
+#### 🟠 [Medium] REV-002 : Magic number
 
+- **Catégorie** : Maintainability
 - **Fichier** : src/server/UDPServer.cpp:78
 - **Pattern violé** : no_magic_numbers
+- **isBug** : ❌ Non
 
 **Code actuel** :
 ```cpp
@@ -301,10 +316,12 @@ if (buffer.size() > MAX_UDP_PAYLOAD) {
 - **Temps estimé** : ~2 min
 - **Bloquant** : Non
 
-#### 🟠 [WARNING] REV-003 : ADR-007 violé
+#### 🟠 [Major] REV-003 : ADR-007 violé
 
+- **Catégorie** : Maintainability
 - **Fichier** : src/server/UDPServer.cpp:92
 - **ADR violé** : ADR-007 "Use error codes over exceptions"
+- **isBug** : ❌ Non
 
 **Code actuel** :
 ```cpp
@@ -329,10 +346,12 @@ ErrorCode sendData(const Buffer& data) {
 - **Temps estimé** : ~10 min
 - **Bloquant** : Non (mais ADR violation)
 
-#### 🟡 [INFO] REV-004 : Fonction non documentée
+#### 🟡 [Minor] REV-004 : Fonction non documentée
 
+- **Catégorie** : Maintainability
 - **Fichier** : src/server/UDPServer.cpp:120
 - **Pattern violé** : doxygen_comments
+- **isBug** : ❌ Non
 
 **Code actuel** :
 ```cpp
@@ -386,9 +405,12 @@ New code:
   "agent": "reviewer",
   "score": 72,
   "issues_count": 7,
-  "errors": 1,
-  "warnings": 3,
-  "infos": 3,
+  "blockers": 0,
+  "critical": 1,
+  "major": 1,
+  "medium": 1,
+  "minor": 1,
+  "info": 3,
   "patterns_loaded": 8,
   "patterns_violated": 3,
   "adrs_checked": 2,
@@ -402,7 +424,9 @@ New code:
   "findings": [
     {
       "id": "REV-001",
-      "severity": "ERROR",
+      "severity": "Critical",
+      "category": "Maintainability",
+      "isBug": false,
       "type": "complexity",
       "file": "src/server/UDPServer.cpp",
       "line": 145,
@@ -414,7 +438,9 @@ New code:
     },
     {
       "id": "REV-002",
-      "severity": "WARNING",
+      "severity": "Medium",
+      "category": "Maintainability",
+      "isBug": false,
       "type": "magic_number",
       "file": "src/server/UDPServer.cpp",
       "line": 78,
@@ -425,7 +451,9 @@ New code:
     },
     {
       "id": "REV-003",
-      "severity": "WARNING",
+      "severity": "Major",
+      "category": "Maintainability",
+      "isBug": false,
       "type": "adr_violation",
       "file": "src/server/UDPServer.cpp",
       "line": 92,
@@ -436,7 +464,9 @@ New code:
     },
     {
       "id": "REV-004",
-      "severity": "INFO",
+      "severity": "Minor",
+      "category": "Maintainability",
+      "isBug": false,
       "type": "documentation",
       "file": "src/server/UDPServer.cpp",
       "line": 120,
@@ -465,9 +495,12 @@ New code:
 Score = 100 - penalties
 
 Pénalités (valeurs par défaut, voir config pour personnaliser) :
-- Issue ERROR : -15 chacune (error)
-- Issue WARNING : -8 chacune (warning)
-- Issue INFO : -3 chacune (info)
+- Issue Blocker : -25 chacune (blocker)
+- Issue Critical : -15 chacune (critical)
+- Issue Major : -10 chacune (major)
+- Issue Medium : -8 chacune (medium)
+- Issue Minor : -5 chacune (minor)
+- Issue Info : -2 chacune (info)
 - Pattern violé : -5 par pattern (pattern_violated)
 - ADR violé : -10 par ADR (adr_violated)
 - Complexité max > seuil : -10 (high_complexity)

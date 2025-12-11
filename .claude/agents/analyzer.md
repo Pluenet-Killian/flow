@@ -212,19 +212,23 @@ DEFAULT_TIMEOUT (src/core/Config.hpp:15) [MODIFIED]
 
 ### Findings
 
-#### [HIGH] ANA-001 : Changement de signature à fort impact
+#### [Critical] ANA-001 : Changement de signature à fort impact
+- **Catégorie** : Reliability
 - **Fichier** : src/server/UDPServer.cpp:42
 - **Symbole** : `sendPacket`
 - **Problème** : 8 appelants doivent être mis à jour
 - **Temps estimé** : ~30 min
 - **Bloquant** : Oui (compilation cassée)
+- **isBug** : Non (erreur de compilation, pas de crash runtime)
 
-#### [MEDIUM] ANA-002 : Fichier critique impacté
+#### [Major] ANA-002 : Fichier critique impacté
+- **Catégorie** : Reliability
 - **Fichier** : src/api/Server.cpp:156
 - **Raison** : Fichier marqué `is_critical` dans AgentDB
 - **Action** : Review par senior requise
 - **Temps estimé** : ~15 min
 - **Bloquant** : Non
+- **isBug** : Non
 
 ### Recommendations
 
@@ -247,7 +251,9 @@ DEFAULT_TIMEOUT (src/core/Config.hpp:15) [MODIFIED]
   "findings": [
     {
       "id": "ANA-001",
-      "severity": "HIGH",
+      "severity": "Critical",
+      "category": "Reliability",
+      "isBug": false,
       "file": "src/server/UDPServer.cpp",
       "line": 42,
       "symbol": "sendPacket",
@@ -257,7 +263,9 @@ DEFAULT_TIMEOUT (src/core/Config.hpp:15) [MODIFIED]
     },
     {
       "id": "ANA-002",
-      "severity": "MEDIUM",
+      "severity": "Major",
+      "category": "Reliability",
+      "isBug": false,
       "file": "src/api/Server.cpp",
       "line": 156,
       "message": "Fichier critique impacté",

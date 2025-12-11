@@ -1,7 +1,6 @@
 ---
 name: analyze
-description: |
-  Lance une analyse incrémentale intelligente du code avec les 5 agents (analyzer, security, reviewer, risk, synthesis).
+description: Lance une analyse incrémentale intelligente du code avec les 5 agents (analyzer, security, reviewer, risk, synthesis).
   Se souvient du dernier commit analysé et n'analyse que les changements depuis.
 
   Usage:
@@ -349,7 +348,17 @@ git diff $LAST_COMMIT..HEAD --stat -- "path/to/file.cpp"
 │                      ▼                                          │
 │                ┌───────────┐                                     │
 │                │ SYNTHESIS │  ← Reçoit les 4 rapports           │
-│                └───────────┘                                     │
+│                └────┬──────┘                                     │
+│                     ▼                                            │
+├─────────────────────────────────────────────────────────────────┤
+│                     PHASE 3 : WEB EXPORT                        │
+│                     ▼                                            │
+│           ┌─────────────────┐                                    │
+│           │ WEB SYNTHESIZER │  ← Transforme pour le site web    │
+│           └─────────────────┘                                    │
+│                     │                                            │
+│                     ▼                                            │
+│           reports/web-report-{date}-{commit}.json                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -370,6 +379,20 @@ Chaque agent DOIT utiliser AgentDB. Vérifie dans chaque rapport la présence de
 ### PHASE 2 : Lancer RISK puis SYNTHESIS (séquentiel)
 
 **Attendre** que les 3 agents de Phase 1 soient terminés.
+
+### PHASE 3 : Lancer WEB SYNTHESIZER (après SYNTHESIS)
+
+**Attendre** que SYNTHESIS soit terminé.
+
+| Agent | subagent_type | Input |
+|-------|---------------|-------|
+| WEB SYNTHESIZER | `web-synthesizer` | Rapport SYNTHESIS complet |
+
+**L'agent WEB SYNTHESIZER** :
+1. Lit le rapport SYNTHESIS (REPORT.md)
+2. Extrait toutes les issues avec leurs métadonnées (severity, category, isBug)
+3. Génère les détails where/why/how pour chaque issue
+4. Produit un fichier JSON dans `reports/web-report-{date}-{commit}.json`
 
 ## ÉTAPE 8 : Créer le dossier de rapport
 
@@ -577,7 +600,39 @@ INSTRUCTIONS :
 4. Détermine le verdict : APPROVE / REVIEW / CAREFUL / REJECT
 5. Produis le rapport final
 
+IMPORTANT - FORMAT DES FINDINGS :
+Chaque finding DOIT inclure :
+- severity : Blocker | Critical | Major | Medium | Minor | Info
+- category : Security | Reliability | Maintainability
+- isBug : true si provoque crash/freeze, false sinon
+
 FORMAT DE SORTIE OBLIGATOIRE : Utilise le format défini dans .claude/agents/synthesis.md
+```
+
+### Prompt WEB SYNTHESIZER
+
+```
+Transforme le rapport SYNTHESIS en format compatible avec le site web CRE Interface.
+
+**Rapport SYNTHESIS** : .claude/reports/{date}-{commit}/REPORT.md
+**Date** : {date}
+**Commit** : {HEAD_SHORT}
+**Branche** : {CURRENT_BRANCH}
+
+INSTRUCTIONS :
+1. Lis le rapport SYNTHESIS complet
+2. Extrait le bloc JSON contenant les findings
+3. Pour chaque finding, génère les détails (where, why, how) en markdown avec mermaid
+4. Assemble le rapport web au format JSON
+5. Sauvegarde dans reports/web-report-{date}-{commit}.json
+
+RÈGLES isBug :
+- isBug = true UNIQUEMENT si l'issue provoque un crash/freeze/gel
+- Buffer overflow, null pointer, division par zéro → isBug = true
+- Vulnérabilités de sécurité sans crash → isBug = false
+- Problèmes de qualité/maintenabilité → isBug = false
+
+FORMAT DE SORTIE OBLIGATOIRE : Utilise le format défini dans .claude/agents/web-synthesizer.md
 ```
 
 ---
@@ -600,7 +655,8 @@ Maintenant, exécute l'analyse en suivant les étapes ci-dessus.
 3. Si mode == reset : mets à jour le checkpoint et TERMINE
 4. Calcule le diff unifié
 5. Si aucun fichier : affiche "Rien à analyser" et TERMINE
-6. Lance les 5 agents
-7. Produis le rapport
-8. Mets à jour le checkpoint avec le verdict
-9. Affiche le verdict final
+6. Lance les agents (PHASE 1: analyzer/security/reviewer, PHASE 2: risk/synthesis, PHASE 3: web-synthesizer)
+7. Produis le rapport SYNTHESIS
+8. Génère le rapport web (web-synthesizer)
+9. Mets à jour le checkpoint avec le verdict
+10. Affiche le verdict final
