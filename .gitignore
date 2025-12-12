@@ -1,4 +1,5 @@
 *.pyc
+env
 
 .claude/agentdb/db.sqlite
 .claude/agentdb/db.sqlite-shm
@@ -11,3 +12,7 @@
 
 .claude/reports/*
 .claude/agentdb/schema.sql
+
+cpp-analyzer
+
+reports/*

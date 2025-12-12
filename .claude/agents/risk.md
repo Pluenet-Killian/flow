@@ -7,7 +7,7 @@ description: |
   - "Quel est le risque de ces modifications ?"
   - "Est-ce safe de merger ?"
   - "Évalue le risque de ce commit"
-tools: Read, Grep, Bash
+tools: Read, Grep, Glob, Bash
 model: opus
 ---
 

@@ -8,7 +8,7 @@ description: |
   - "Génère le rapport web"
   - "Transforme pour le site"
 tools: Read, Bash
-model: haiku
+model: opus
 ---
 
 # Agent WEB SYNTHESIZER

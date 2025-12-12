@@ -416,7 +416,7 @@ mkdir -p "$REPORT_DIR"
 └── REPORT.md
 ```
 
-## ÉTAPE 10 : Mettre à jour le checkpoint
+## ÉTAPE 10 : Mettre à jour le checkpoint et enregistrer l'analyse
 
 **APRÈS** avoir généré le rapport final et obtenu le verdict :
 
@@ -428,7 +428,17 @@ bash .claude/agentdb/query.sh set_checkpoint \
     "$FILES_COUNT" \
     "$VERDICT" \
     "$SCORE"
+
+# Enregistrer l'analyse dans l'historique des pipeline_runs
+bash .claude/agentdb/query.sh record_pipeline_run \
+    "$CURRENT_BRANCH" \
+    "$HEAD_COMMIT" \
+    "$SCORE" \
+    "$VERDICT" \
+    "$FILES_COUNT"
 ```
+
+**Note** : L'enregistrement du pipeline_run permet de suivre l'évolution des scores dans le temps et de détecter les tendances. Ces données sont consultables via `bash .claude/agentdb/query.sh list_pipeline_runs`.
 
 ## ÉTAPE 11 : Afficher le verdict final
 
@@ -644,6 +654,42 @@ FORMAT DE SORTIE OBLIGATOIRE : Utilise le format défini dans .claude/agents/web
 - Si un agent échoue, continuer avec les autres
 - Signaler l'erreur dans le rapport final
 - Ne jamais bloquer à cause d'AgentDB manquant
+
+---
+
+## Commandes utilitaires
+
+### reset_checkpoint
+
+La commande `reset_checkpoint` permet de supprimer le checkpoint d'analyse d'une branche dans AgentDB.
+
+**Quand l'utiliser :**
+- Forcer une ré-analyse complète sans utiliser `--all`
+- Débugger un problème de checkpoint corrompu
+- Tester le comportement "première analyse" sur une branche existante
+- Nettoyer les checkpoints de branches supprimées
+
+**Usage :**
+
+```bash
+# Supprimer le checkpoint de la branche courante
+bash .claude/agentdb/query.sh reset_checkpoint "$(git branch --show-current)"
+
+# Supprimer le checkpoint d'une branche spécifique
+bash .claude/agentdb/query.sh reset_checkpoint "feature/my-branch"
+
+# Lister tous les checkpoints existants
+bash .claude/agentdb/query.sh list_checkpoints
+```
+
+**Ce que fait la commande :**
+- Supprime l'entrée de la branche dans la table `analysis_checkpoints`
+- La prochaine exécution de `/analyze` sur cette branche se comportera comme une première analyse
+- Elle calculera le merge-base avec main/develop comme point de départ
+
+**Différence avec `--reset` :**
+- `/analyze --reset` : Met le checkpoint à HEAD **sans analyser** (prochaine analyse partira de HEAD)
+- `reset_checkpoint` : Supprime le checkpoint (prochaine analyse partira du merge-base)
 
 ---
 

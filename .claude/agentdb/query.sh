@@ -29,6 +29,9 @@
 #   reset_checkpoint <branch>                        - Supprime le checkpoint
 #   list_checkpoints                                 - Liste tous les checkpoints
 #
+# Pipeline Recording Commands:
+#   record_pipeline_run <branch> <commit> <score> <verdict> <files_count> - Enregistre une analyse
+#
 # Examples:
 #   bash .claude/agentdb/query.sh file_context "src/server/UDPServer.cpp"
 #   bash .claude/agentdb/query.sh symbol_callers "sendPacket"
@@ -1080,6 +1083,144 @@ cmd_list_checkpoints() {
 }
 
 # =============================================================================
+# COMMANDES POUR L'ENREGISTREMENT DES ANALYSES
+# =============================================================================
+
+cmd_record_pipeline_run() {
+    local branch="$1"
+    local commit="$2"
+    local score="${3:-0}"
+    local verdict="${4:-UNKNOWN}"
+    local files_count="${5:-0}"
+
+    if [[ -z "$branch" || -z "$commit" ]]; then
+        echo '{"error": "Usage: record_pipeline_run <branch> <commit> <score> <verdict> <files_count>"}'
+        return 1
+    fi
+
+    # Validation des entrées
+    if ! validate_branch_name "$branch"; then
+        echo '{"error": "Invalid branch name format"}'
+        return 1
+    fi
+
+    if ! validate_git_hash "$commit"; then
+        echo '{"error": "Invalid commit hash format (must be hexadecimal)"}'
+        return 1
+    fi
+
+    # Valider score est un nombre
+    if ! [[ "$score" =~ ^[0-9]+$ ]]; then
+        score=0
+    fi
+
+    # Valider files_count est un nombre
+    if ! [[ "$files_count" =~ ^[0-9]+$ ]]; then
+        files_count=0
+    fi
+
+    # Échapper les valeurs pour SQL
+    local safe_branch=$(sql_escape "$branch")
+    local safe_verdict=$(sql_escape "$verdict")
+
+    # Récupérer les infos du commit
+    local commit_short=$(git rev-parse --short "$commit" 2>/dev/null || echo "$commit")
+    local commit_message=$(git log -1 --format="%s" "$commit" 2>/dev/null || echo "")
+    local commit_author=$(git log -1 --format="%an" "$commit" 2>/dev/null || echo "")
+    local safe_commit_message=$(sql_escape "$commit_message")
+    local safe_commit_author=$(sql_escape "$commit_author")
+
+    # Générer un run_id unique
+    local run_id="run-$(date +%Y%m%d-%H%M%S)-$(echo $RANDOM | md5sum | head -c 8)"
+    local started_at=$(date -Iseconds)
+
+    # Calculer les compteurs de sévérité basés sur le score
+    local issues_critical=0
+    local issues_high=0
+    local issues_medium=0
+    local issues_low=0
+
+    # Estimation basique basée sur le score
+    if [[ "$score" -lt 40 ]]; then
+        issues_critical=1
+    elif [[ "$score" -lt 60 ]]; then
+        issues_high=1
+    elif [[ "$score" -lt 80 ]]; then
+        issues_medium=1
+    else
+        issues_low=0
+    fi
+
+    # Mapper le verdict vers un status
+    local status="completed"
+
+    # Insérer dans pipeline_runs
+    sqlite3 "$DB_PATH" "
+        INSERT INTO pipeline_runs (
+            run_id, commit_hash, commit_message, commit_author,
+            branch_source, status, overall_score, recommendation,
+            issues_critical, issues_high, issues_medium, issues_low,
+            files_analyzed, started_at, completed_at
+        ) VALUES (
+            '$run_id', '$commit', '$safe_commit_message', '$safe_commit_author',
+            '$safe_branch', '$status', $score, '$safe_verdict',
+            $issues_critical, $issues_high, $issues_medium, $issues_low,
+            $files_count, '$started_at', datetime('now')
+        );
+    "
+
+    # Retourner le résultat
+    jq -n \
+        --arg run_id "$run_id" \
+        --arg branch "$branch" \
+        --arg commit "$commit" \
+        --argjson score "$score" \
+        --arg verdict "$verdict" \
+        --argjson files "$files_count" \
+        '{
+            success: true,
+            run_id: $run_id,
+            branch: $branch,
+            commit: $commit,
+            score: $score,
+            verdict: $verdict,
+            files_analyzed: $files,
+            message: "Pipeline run recorded successfully"
+        }'
+}
+
+cmd_list_pipeline_runs() {
+    local limit="${1:-10}"
+
+    # Valider limit est un nombre
+    if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        limit=10
+    fi
+
+    local runs=$(sqlite_json "
+        SELECT
+            run_id,
+            branch_source as branch,
+            commit_hash,
+            overall_score as score,
+            recommendation as verdict,
+            files_analyzed,
+            started_at
+        FROM pipeline_runs
+        ORDER BY started_at DESC
+        LIMIT $limit
+    ")
+
+    jq -n \
+        --argjson runs "$runs" \
+        --argjson limit "$limit" \
+        '{
+            limit: $limit,
+            runs: $runs
+        }'
+}
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1158,6 +1299,12 @@ case "$cmd" in
         ;;
     list_checkpoints)
         run_with_logging "list_checkpoints" cmd_list_checkpoints
+        ;;
+    record_pipeline_run)
+        run_with_logging "record_pipeline_run" cmd_record_pipeline_run "$@"
+        ;;
+    list_pipeline_runs)
+        run_with_logging "list_pipeline_runs" cmd_list_pipeline_runs "$@"
         ;;
     help|--help|-h)
         head -40 "${BASH_SOURCE[0]}" | tail -n +2 | sed 's/^# //' | sed 's/^#//'
