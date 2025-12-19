@@ -1,98 +1,449 @@
 # claude.py
 """
 Module pour lancer Claude Code de manière programmatique avec streaming des logs.
+Architecture async native pour éviter les timeouts.
 """
 
-import subprocess
-import pty
-import os
-import sys
-import select
-import re
-import time
-import fcntl
-import struct
-import termios
-import json
-from pathlib import Path
-from typing import Callable, Optional
 import asyncio
-import websockets
-import threading
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
-def log_to_stderr(text: str):
+import websockets
+
+
+# =============================================================================
+# Utilitaires
+# =============================================================================
+
+def log_to_stderr(text: str) -> None:
     """Log vers stderr pour voir en temps réel dans le terminal."""
     sys.stderr.write(text)
     sys.stderr.flush()
 
+
+def strip_ansi(text: str) -> str:
+    """Supprime les séquences ANSI de contrôle (couleurs, curseur, etc.)."""
+    ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+    text = ansi_escape.sub('', text)
+    text = re.sub(r'\x1B\].*?(?:\x07|\x1B\\)', '', text)
+    text = re.sub(r'\x1B[()][AB012]', '', text)
+    text = re.sub(r'\x1B[@-_]', '', text)
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', text)
+    return text
+
+
 def switch_branch(branch_name: str) -> bool:
     """Change de branche git."""
-    print(f"Switching to branch: {branch_name}\n")
+    log_to_stderr(f"Switching to branch: {branch_name}\n")
     result = subprocess.run(
         ["git", "checkout", branch_name],
         capture_output=True,
         text=True
     )
-    print(result.stdout)
+    if result.stdout:
+        log_to_stderr(result.stdout)
     return result.returncode == 0
 
 
-def strip_ansi(text: str) -> str:
-    """Supprime les séquences ANSI de contrôle (couleurs, curseur, etc.)."""
-    # Séquences CSI (Control Sequence Introducer)
-    ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
-    text = ansi_escape.sub('', text)
-    # Séquences OSC (Operating System Command)
-    text = re.sub(r'\x1B\].*?(?:\x07|\x1B\\)', '', text)
-    # Autres séquences d'échappement
-    text = re.sub(r'\x1B[()][AB012]', '', text)
-    text = re.sub(r'\x1B[@-_]', '', text)
-    # Caractères de contrôle restants (sauf newline et tab)
-    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', text)
-    return text
+# =============================================================================
+# WebSocket Notifier
+# =============================================================================
 
-async def wb_client(type:str, jobId: str):
-    print(f"Starting websocket client jobId {jobId}...\n")
-    async with websockets.connect(f"ws://cre-interface-host:8080/api/ws/jobs/{jobId}") as websocket:
-        while True:
-            message = {
-                "type": "action_started",
-                "steps": ["setup", "compile", "test", "package"]
-            }
-            await websocket.send(message)
+@dataclass
+class StepInfo:
+    """Informations sur une étape en cours."""
+    name: str
+    status: str = "running"
+
+
+class WebSocketNotifier:
+    """
+    Gère la communication WebSocket pour notifier l'avancement.
+    Encapsule toute la logique de messaging.
+    """
+
+    STEPS = [
+        "setup",           # Initialisation
+        "phase1",          # ANALYZER + SECURITY + REVIEWER (parallèle)
+        "phase2_risk",     # RISK
+        "phase2_parallel", # SYNTHESIS + SONAR (parallèle)
+        "phase3",          # META-SYNTHESIS
+        "phase4",          # WEB-SYNTHESIZER
+        "report"           # Envoi du rapport final
+    ]
+
+    # Mapping agent -> phase
+    AGENT_TO_PHASE = {
+        "analyzer": "phase1",
+        "security": "phase1",
+        "reviewer": "phase1",
+        "risk": "phase2_risk",
+        "synthesis": "phase2_parallel",
+        "sonar": "phase2_parallel",
+        "meta-synthesis": "phase3",
+        "web-synthesizer": "phase4",
+    }
+
+    def __init__(self, websocket):
+        self.ws = websocket
+        self.current_step: Optional[str] = None
+        self.action_status: str = "success"
+        self.action_completed: bool = False
+        self.agents_in_phase: dict[str, set] = {}  # phase -> set d'agents lancés
+        self.report_path: Optional[str] = None     # Chemin du rapport final
+
+    async def send(self, message: dict) -> None:
+        """Envoie un message JSON au WebSocket."""
+        try:
+            await self.ws.send(json.dumps(message))
+        except websockets.exceptions.ConnectionClosed:
+            log_to_stderr("[WS] Connection closed, cannot send message\n")
+
+    async def action_started(self) -> None:
+        """Notifie le début de l'action avec les étapes."""
+        await self.send({
+            "type": "action_started",
+            "steps": self.STEPS
+        })
+
+    async def step_started(self, step: str) -> None:
+        """Notifie le début d'une étape."""
+        self.current_step = step
+        await self.send({
+            "type": "step_started",
+            "step": step
+        })
+
+    async def step_log(self, line: str, stream: str = "stdout") -> None:
+        """Envoie un log pour l'étape en cours."""
+        if not self.current_step:
+            return
+        await self.send({
+            "type": "step_log",
+            "step": self.current_step,
+            "line": line,
+            "stream": stream
+        })
+
+    async def step_complete(self, status: str, output: str = "") -> None:
+        """Marque l'étape en cours comme terminée."""
+        if not self.current_step:
+            return
+        if status == "failure":
+            self.action_status = "failure"
+        await self.send({
+            "type": "step_complete",
+            "step": self.current_step,
+            "status": status,
+            "output": output
+        })
+
+    async def action_complete(self) -> None:
+        """Marque l'action comme terminée."""
+        if self.action_completed:
+            return
+        self.action_completed = True
+        await self.send({
+            "type": "action_complete",
+            "status": self.action_status
+        })
+
+    async def transition_to(self, new_step: str, prev_output: str = "") -> None:
+        """Transition propre d'une étape à une autre."""
+        if self.current_step and self.current_step != new_step:
+            await self.step_complete("success", prev_output)
+        await self.step_started(new_step)
+
+    async def on_agent_started(self, agent_type: str) -> None:
+        """Gère le lancement d'un agent et la transition de phase."""
+        phase = self.AGENT_TO_PHASE.get(agent_type)
+        if not phase:
+            return
+
+        # Tracker l'agent dans sa phase
+        if phase not in self.agents_in_phase:
+            self.agents_in_phase[phase] = set()
+        self.agents_in_phase[phase].add(agent_type)
+
+        # Transition vers la nouvelle phase si nécessaire
+        if self.current_step != phase:
+            await self.transition_to(phase, f"Completed {self.current_step}")
+
+    async def report_ready(self, report_path: str) -> None:
+        """Envoie le rapport JSON final via WebSocket."""
+        self.report_path = report_path
+
+        try:
+            report_data = json.loads(Path(report_path).read_text())
+            await self.send({
+                "type": "report_ready",
+                "path": report_path,
+                "data": report_data
+            })
+            log_to_stderr(f"\n📤 Report sent via WebSocket: {report_path}\n")
+        except FileNotFoundError:
+            log_to_stderr(f"\n❌ Report file not found: {report_path}\n")
+            await self.send({
+                "type": "report_error",
+                "path": report_path,
+                "error": "File not found"
+            })
+        except json.JSONDecodeError as e:
+            log_to_stderr(f"\n❌ Invalid JSON in report: {e}\n")
+            await self.send({
+                "type": "report_error",
+                "path": report_path,
+                "error": f"Invalid JSON: {e}"
+            })
+
+
+# =============================================================================
+# Handlers pour les outils Claude
+# =============================================================================
+
+TOOL_FORMATTERS = {
+    "Bash": lambda inp: f"$ {inp.get('command', '')[:200]}",
+    "Read": lambda inp: f"📄 {inp.get('file_path', '')}",
+    "Edit": lambda inp: f"✏️  {inp.get('file_path', '')}",
+    "Write": lambda inp: f"📝 {inp.get('file_path', '')}",
+    "Grep": lambda inp: f"🔍 Pattern: {inp.get('pattern', '')}",
+    "Glob": lambda inp: f"📂 Pattern: {inp.get('pattern', '')}",
+    "Task": lambda inp: f"🚀 {inp.get('subagent_type', 'agent')}: {inp.get('description', '')}",
+}
+
+
+def format_tool_log(tool_name: str, tool_input: dict) -> str:
+    """Formate le log d'un outil de manière concise."""
+    formatter = TOOL_FORMATTERS.get(tool_name)
+    if formatter:
+        return f"🔧 {tool_name}: {formatter(tool_input)}"
+    return f"🔧 {tool_name}: {json.dumps(tool_input, ensure_ascii=False)[:200]}"
+
+
+# =============================================================================
+# Processeur d'événements Claude
+# =============================================================================
+
+class ClaudeEventProcessor:
+    """
+    Traite les événements JSON streamés par Claude.
+    Sépare la logique de parsing de la logique de notification.
+    """
+
+    def __init__(self, notifier: WebSocketNotifier, verbosity: int = 1):
+        self.notifier = notifier
+        self.verbosity = verbosity
+        self.result_text = ""
+        self.total_cost = 0.0
+        self.messages = []
+        self.pending_report_path: Optional[str] = None  # Chemin du rapport détecté
+
+    async def process_event(self, event: dict) -> None:
+        """Traite un événement JSON de Claude."""
+        event_type = event.get("type", "")
+
+        if self.verbosity >= 2:
+            log_to_stderr(f"\n[DEBUG] {event_type}: {json.dumps(event, ensure_ascii=False)[:500]}\n")
+
+        handler = getattr(self, f"_handle_{event_type}", None)
+        if handler:
+            await handler(event)
+
+        self.messages.append(event)
+
+    async def _handle_assistant(self, event: dict) -> None:
+        """Traite les messages de l'assistant."""
+        content = event.get("message", {}).get("content", [])
+
+        for block in content:
+            block_type = block.get("type")
+
+            if block_type == "text":
+                text = block.get("text", "")
+                self.result_text += text
+                log_to_stderr(text)
+                await self.notifier.step_log(text.strip())
+
+            elif block_type == "tool_use":
+                await self._handle_tool_use(block)
+
+            elif block_type == "thinking":
+                thinking = block.get("thinking", "")
+                preview = thinking[:500] + "..." if len(thinking) > 500 else thinking
+                log_to_stderr(f"\n💭 [Thinking]: {preview}\n")
+                await self.notifier.step_log(f"[Thinking] {thinking[:200]}")
+
+    async def _handle_tool_use(self, block: dict) -> None:
+        """Traite l'utilisation d'un outil."""
+        tool_name = block.get("name", "unknown")
+        tool_input = block.get("input", {})
+
+        # Détecter les agents Task
+        if tool_name == "Task":
+            agent_type = tool_input.get("subagent_type", "")
+            if agent_type:
+                await self.notifier.on_agent_started(agent_type)
+                tool_log = f"🚀 Agent: {agent_type} - {tool_input.get('description', '')}"
+                log_to_stderr(f"\n{tool_log}\n")
+                await self.notifier.step_log(tool_log)
+                return
+
+        # Détecter la création du rapport web (Bash ou Write)
+        if tool_name in ("Bash", "Write"):
+            content = tool_input.get("command", "") or tool_input.get("file_path", "")
+            # Pattern: reports/web-report-YYYY-MM-DD-commit.json
+            match = re.search(r'reports/web-report-[\w-]+\.json', content)
+            if match:
+                self.pending_report_path = match.group(0)
+                log_to_stderr(f"\n📋 Report will be created: {self.pending_report_path}\n")
+
+        tool_log = format_tool_log(tool_name, tool_input)
+        log_to_stderr(f"\n{tool_log}\n")
+        await self.notifier.step_log(tool_log)
+
+    async def _handle_content_block_start(self, event: dict) -> None:
+        """Traite le début d'un bloc de contenu."""
+        block = event.get("content_block", {})
+        block_type = block.get("type", "")
+
+        if block_type == "tool_use":
+            log_to_stderr(f"\n⏳ Starting tool: {block.get('name', '')}...\n")
+        elif block_type == "thinking":
+            log_to_stderr("\n💭 [Claude réfléchit...]\n")
+
+    async def _handle_content_block_delta(self, event: dict) -> None:
+        """Traite le streaming de contenu."""
+        delta = event.get("delta", {})
+        delta_type = delta.get("type", "")
+
+        if delta_type == "text_delta":
+            text = delta.get("text", "")
+            self.result_text += text
+            log_to_stderr(text)
+        elif delta_type == "thinking_delta":
+            log_to_stderr(f"💭 {delta.get('thinking', '')}")
+
+    async def _handle_user(self, event: dict) -> None:
+        """Traite les messages utilisateur (résultats d'outils)."""
+        content = event.get("message", {}).get("content", [])
+
+        for block in content:
+            if block.get("type") != "tool_result":
+                continue
+
+            tool_content = block.get("content", "")
+            is_error = block.get("is_error", False)
+
+            # Tronquer si trop long
+            if isinstance(tool_content, str):
+                display = tool_content[:300] + "..." if len(tool_content) > 300 else tool_content
+            else:
+                display = str(tool_content)[:300]
+
+            if is_error:
+                log_to_stderr(f"\n❌ Tool Error: {display}\n")
+                await self.notifier.step_log(f"❌ Error: {display}", "stderr")
+            else:
+                log_to_stderr(f"\n✅ Tool Result: {display}\n")
+                await self.notifier.step_log(f"✅ Result: {display[:200]}")
+
+    async def _handle_system(self, event: dict) -> None:
+        """Traite les messages système."""
+        subtype = event.get("subtype", "")
+        log_to_stderr(f"\n🔔 [System - {subtype}]\n")
+        await self.notifier.step_log(f"[System] {subtype}")
+
+    async def _handle_result(self, event: dict) -> None:
+        """Traite le résultat final."""
+        self.total_cost = event.get("cost_usd", 0.0)
+        log_to_stderr(f"\n\n💰 Cost: ${self.total_cost:.4f}\n")
+
+        # Transition vers la phase report
+        await self.notifier.transition_to("report", "Analysis phases completed")
+        await self.notifier.step_log(f"💰 Cost: ${self.total_cost:.4f}")
+
+        # Envoyer le rapport JSON si détecté
+        if self.pending_report_path:
+            await self.notifier.step_log(f"📤 Sending report: {self.pending_report_path}")
+            await self.notifier.report_ready(self.pending_report_path)
+        else:
+            log_to_stderr("\n⚠️ No report path detected\n")
+            await self.notifier.step_log("⚠️ No report path detected", "stderr")
+
+        # Finaliser
+        await self.notifier.step_complete("success", f"## Result\n\n{self.result_text[:1000]}")
+        await self.notifier.action_complete()
+
+    async def _handle_error(self, event: dict) -> None:
+        """Traite les erreurs."""
+        error_msg = event.get("error", {}).get("message", "Unknown error")
+        log_to_stderr(f"\n❌ Erreur: {error_msg}\n")
+        await self.notifier.step_log(f"Error: {error_msg}", "stderr")
+        await self.notifier.step_complete("failure", f"## Error\n\n{error_msg}")
+        await self.notifier.action_complete()
+
+
+# =============================================================================
+# Fonction principale de streaming
+# =============================================================================
+
+async def read_stream(stream, processor: ClaudeEventProcessor) -> None:
+    """Lit un stream de manière asynchrone et traite les événements."""
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+
+        line = line.decode('utf-8', errors='replace').strip()
+        if not line:
+            continue
+
+        try:
+            event = json.loads(line)
+            await processor.process_event(event)
+        except json.JSONDecodeError:
+            log_to_stderr(f"{line}\n")
+
+
+async def read_stderr(stream) -> str:
+    """Lit stderr de manière asynchrone."""
+    output = []
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        decoded = line.decode('utf-8', errors='replace')
+        output.append(decoded)
+        log_to_stderr(f"[stderr] {decoded}")
+    return "".join(output)
+
 
 async def launch_claude_stream_json(
     prompt: str,
     request,
-    max_timeout: int = 1800,
+    max_timeout: int = 7200,
     verbosity: int = 1,
-    show_tool_results: bool = True
+    ws_url: str = "ws://192.36.128.57:8080/api/ws/jobs"
 ) -> dict:
     """
-    Lance Claude en mode stream-json pour un parsing propre des événements.
+    Lance Claude en mode stream-json avec architecture async native.
 
     Args:
         prompt: Le prompt complet à envoyer à Claude
-        log_callback: Fonction appelée pour chaque message de log
+        request: L'objet request contenant les infos du job
         max_timeout: Timeout maximum en secondes (défaut: 30 minutes)
-        verbosity: Niveau de verbosité (0=minimal, 1=normal, 2=debug JSON)
-        show_tool_results: Si True, affiche les résultats des outils
+        verbosity: Niveau de verbosité (0=minimal, 1=normal, 2=debug)
+        ws_url: URL du serveur WebSocket
 
     Returns:
         dict avec 'success', 'result', 'cost', 'messages'
     """
-
-    def log(msg: str):
-        if log_to_stderr:
-            log_to_stderr(msg)
-
-    messages = []
-    result_text = ""
-    total_cost = 0.0
-    current_step = None
-    action_status = "success"  # Sera mis à "failure" si une étape échoue
-    action_completed = False  # Pour éviter d'envoyer action_complete plusieurs fois
-
     cmd = [
         "claude",
         "-p", prompt,
@@ -102,305 +453,86 @@ async def launch_claude_stream_json(
     ]
 
     try:
-        log("    (stream-json)...\n")
+        log_to_stderr("🚀 Starting Claude (stream-json)...\n")
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1  # Line buffered
-        )
+        # Connexion WebSocket avec timeout
+        async with asyncio.timeout(60):
+            websocket = await websockets.connect(ws_url + f"/{request.jobId}")
 
-        start_time = time.time()
+        async with websocket:
+            notifier = WebSocketNotifier(websocket)
+            processor = ClaudeEventProcessor(notifier, verbosity)
 
-        async with websockets.connect(f"ws://localhost:8765") as websocket:
+            # Démarrer l'action
+            await notifier.action_started()
+            await notifier.step_started("setup")
+            await notifier.step_log("Initializing Claude stream-json...")
+            await notifier.step_complete("success", "Setup completed")
+            # Les phases (phase1, phase2_risk, etc.) démarrent automatiquement
+            # quand les agents Task sont détectés dans _handle_tool_use
 
-            # Helper functions for WebSocket messages
-            async def send_action_started(steps: list):
-                await websocket.send(json.dumps({
-                    "type": "action_started",
-                    "steps": steps
-                }))
+            # Lancer le processus Claude
+            # limit=1MB pour éviter "Separator is found, but chunk is longer than limit"
+            # quand Claude génère des lignes JSON très longues (rapports avec markdown)
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=dict(os.environ),  # Hérite du PATH complet (fnm, nvm, etc.)
+                limit=2**20  # 1MB au lieu de 64KB par défaut
+            )
 
-            async def send_step_started(step: str):
-                nonlocal current_step
-                current_step = step
-                await websocket.send(json.dumps({
-                    "type": "step_started",
-                    "step": step
-                }))
+            try:
+                # Lire stdout et stderr en parallèle avec timeout
+                async with asyncio.timeout(max_timeout):
+                    await asyncio.gather(
+                        read_stream(process.stdout, processor),
+                        read_stderr(process.stderr)
+                    )
+                    await process.wait()
 
-            async def send_step_log(step: str, line: str, stream: str = "stdout"):
-                await websocket.send(json.dumps({
-                    "type": "step_log",
-                    "step": step,
-                    "line": line,
-                    "stream": stream
-                }))
+            except asyncio.TimeoutError:
+                log_to_stderr(f"\n⏱️ Timeout atteint ({max_timeout}s)\n")
+                await notifier.step_log(f"Timeout after {max_timeout}s", "stderr")
+                await notifier.step_complete("failure", f"Timeout after {max_timeout}s")
+                await notifier.action_complete()
+                process.kill()
+                await process.wait()
 
-            async def send_step_complete(step: str, status: str, output: str = ""):
-                nonlocal action_status
-                if status == "failure":
-                    action_status = "failure"
-                await websocket.send(json.dumps({
-                    "type": "step_complete",
-                    "step": step,
-                    "status": status,
-                    "output": output
-                }))
+                return {
+                    "success": False,
+                    "result": processor.result_text,
+                    "cost": processor.total_cost,
+                    "messages": processor.messages,
+                    "error": f"Timeout after {max_timeout}s"
+                }
 
-            async def send_action_complete(status: str):
-                nonlocal action_completed
-                if action_completed:
-                    return  # Déjà envoyé
-                action_completed = True
-                await websocket.send(json.dumps({
-                    "type": "action_complete",
-                    "status": status
-                }))
+            # Finaliser si pas encore fait
+            if not notifier.action_completed:
+                if notifier.current_step:
+                    await notifier.step_complete(notifier.action_status, "Process completed")
+                await notifier.action_complete()
 
-            # Envoyer action_started avec les étapes
-            await send_action_started(["setup", "analyze", "tools", "synthesis"])
-            print("Sending websocket message...\n")
+            return {
+                "success": process.returncode == 0,
+                "result": processor.result_text,
+                "cost": processor.total_cost,
+                "messages": processor.messages,
+                "returncode": process.returncode
+            }
 
-            # Démarrer l'étape setup
-            await send_step_started("setup")
-            await send_step_log("setup", "Initializing Claude stream-json...", "stdout")
-            await send_step_complete("setup", "success", "Setup completed")
-
-            # Démarrer l'étape analyze
-            await send_step_started("analyze")
-
-            while True:
-
-                # Vérifier timeout
-                if time.time() - start_time > max_timeout:
-                    log(f"\nTimeout maximum atteint ({max_timeout}s)\n")
-                    if current_step:
-                        await send_step_log(current_step, f"Timeout after {max_timeout}s", "stderr")
-                        await send_step_complete(current_step, "failure", f"Timeout after {max_timeout}s")
-                    await send_action_complete("failure")
-                    process.kill()
-                    break
-
-                # Utiliser select pour éviter le blocage
-                if process.stdout:
-                    readable, _, _ = select.select([process.stdout], [], [], 1.0)
-
-                    if readable:
-                        line = process.stdout.readline()
-                        if not line:
-                            # Fin du stdout - compléter si pas encore fait
-                            if current_step and not action_completed:
-                                await send_step_complete(current_step, action_status, "Stream completed")
-                                await send_action_complete(action_status)
-                            break
-
-                        line = line.strip()
-                        if not line:
-                            continue
-
-                        try:
-                            event = json.loads(line)
-                            event_type = event.get("type", "")
-
-                            # Mode debug (verbosity=2): affiche les événements JSON bruts
-                            if verbosity >= 2:
-                                log(f"\n[DEBUG] {event_type}: {json.dumps(event, ensure_ascii=False)[:500]}\n")
-
-                            if event_type == "assistant":
-                                # Message de l'assistant
-                                msg = event.get("message", {})
-                                content = msg.get("content", [])
-                                for block in content:
-                                    if block.get("type") == "text":
-                                        text = block.get("text", "")
-                                        result_text += text
-                                        log(text)
-                                        # Envoyer step_log pour le texte de l'assistant
-                                        if current_step:
-                                            await send_step_log(current_step, text.strip(), "stdout")
-                                    elif block.get("type") == "tool_use":
-                                        tool_name = block.get("name", "unknown")
-                                        tool_input = block.get("input", {})
-
-                                        # Passer à l'étape tools si on n'y est pas déjà
-                                        if current_step != "tools":
-                                            if current_step == "analyze":
-                                                await send_step_complete("analyze", "success", "Analysis completed")
-                                            await send_step_started("tools")
-
-                                        tool_log = f"🔧 Tool: {tool_name}"
-                                        log(f"\n╭─ 🔧 Tool: {tool_name}\n")
-                                        if tool_name == "Bash":
-                                            cmd_str = tool_input.get("command", "")
-                                            desc = tool_input.get("description", "")
-                                            if desc:
-                                                log(f"│  📝 {desc}\n")
-                                                tool_log += f" - {desc}"
-                                            log(f"│  $ {cmd_str[:200]}{'...' if len(cmd_str) > 200 else ''}\n")
-                                        elif tool_name == "Read":
-                                            log(f"│  📄 {tool_input.get('file_path', '')}\n")
-                                            tool_log += f" - {tool_input.get('file_path', '')}"
-                                        elif tool_name == "Edit":
-                                            log(f"│  ✏️  {tool_input.get('file_path', '')}\n")
-                                            tool_log += f" - {tool_input.get('file_path', '')}"
-                                        elif tool_name == "Write":
-                                            log(f"│  📝 {tool_input.get('file_path', '')}\n")
-                                            tool_log += f" - {tool_input.get('file_path', '')}"
-                                        elif tool_name == "Grep":
-                                            log(f"│  🔍 Pattern: {tool_input.get('pattern', '')}\n")
-                                            tool_log += f" - Pattern: {tool_input.get('pattern', '')}"
-                                        elif tool_name == "Glob":
-                                            log(f"│  📂 Pattern: {tool_input.get('pattern', '')}\n")
-                                            tool_log += f" - Pattern: {tool_input.get('pattern', '')}"
-                                        else:
-                                            # Autres outils: afficher l'input complet
-                                            log(f"│  Input: {json.dumps(tool_input, ensure_ascii=False)[:300]}\n")
-                                        log(f"╰─\n")
-                                        await send_step_log("tools", tool_log, "stdout")
-                                    elif block.get("type") == "thinking":
-                                        # Bloc de réflexion (extended thinking)
-                                        thinking_text = block.get("thinking", "")
-                                        log(f"\n💭 [Thinking]: {thinking_text[:500]}{'...' if len(thinking_text) > 500 else ''}\n")
-                                        if current_step:
-                                            await send_step_log(current_step, f"[Thinking] {thinking_text[:200]}", "stdout")
-
-                            elif event_type == "content_block_start":
-                                # Début d'un bloc de contenu
-                                block = event.get("content_block", {})
-                                block_type = block.get("type", "")
-                                if block_type == "tool_use":
-                                    tool_name = block.get("name", "")
-                                    log(f"\n⏳ Starting tool: {tool_name}...\n")
-                                elif block_type == "thinking":
-                                    log(f"\n💭 [Claude réfléchit...]\n")
-
-                            elif event_type == "content_block_delta":
-                                # Streaming de contenu
-                                delta = event.get("delta", {})
-                                delta_type = delta.get("type", "")
-                                if delta_type == "text_delta":
-                                    text = delta.get("text", "")
-                                    result_text += text
-                                    log(text)
-                                elif delta_type == "thinking_delta":
-                                    # Streaming de la réflexion
-                                    thinking = delta.get("thinking", "")
-                                    log(f"💭 {thinking}")
-                                elif delta_type == "input_json_delta":
-                                    # Streaming de l'input d'un outil
-                                    partial = delta.get("partial_json", "")
-                                    # On peut choisir de ne pas l'afficher car c'est partiel
-                                    pass
-
-                            elif event_type == "content_block_stop":
-                                # Fin d'un bloc - on peut ajouter un marqueur
-                                pass
-
-                            elif event_type == "tool_result":
-                                # Résultat d'un outil (user message contenant le résultat)
-                                pass  # Généralement traité via "user" event
-
-                            elif event_type == "user":
-                                # Message utilisateur (souvent les résultats d'outils)
-                                if show_tool_results:
-                                    msg = event.get("message", {})
-                                    content = msg.get("content", [])
-                                    for block in content:
-                                        if block.get("type") == "tool_result":
-                                            tool_use_id = block.get("tool_use_id", "")
-                                            tool_content = block.get("content", "")
-                                            is_error = block.get("is_error", False)
-
-                                            # Tronquer si trop long
-                                            if isinstance(tool_content, str) and len(tool_content) > 500:
-                                                display_content = tool_content[:500] + "..."
-                                            else:
-                                                display_content = str(tool_content)[:500]
-
-                                            if is_error:
-                                                log(f"\n❌ Tool Error: {display_content}\n")
-                                                await send_step_log("tools", f"❌ Error: {display_content}", "stderr")
-                                            else:
-                                                log(f"\n✅ Tool Result: {display_content}\n")
-                                                await send_step_log("tools", f"✅ Result: {display_content[:200]}", "stdout")
-
-                            elif event_type == "system":
-                                # Message système
-                                msg = event.get("message", {})
-                                subtype = event.get("subtype", "")
-                                log(f"\n🔔 [System - {subtype}]\n")
-                                if current_step:
-                                    await send_step_log(current_step, f"[System] {subtype}", "stdout")
-
-                            elif event_type == "result":
-                                # Résultat final
-                                total_cost = event.get("cost_usd", 0.0)
-                                log(f"\n\nCost: ${total_cost:.4f}\n")
-
-                                # Compléter l'étape en cours et passer à synthesis
-                                if current_step == "tools":
-                                    await send_step_complete("tools", "success", "Tools execution completed")
-                                elif current_step == "analyze":
-                                    await send_step_complete("analyze", "success", "Analysis completed")
-
-                                await send_step_started("synthesis")
-                                await send_step_log("synthesis", f"Generating final result (Cost: ${total_cost:.4f})", "stdout")
-                                await send_step_complete("synthesis", "success", f"## Result\n\n{result_text[:1000]}")
-                                await send_action_complete(action_status)
-
-                            elif event_type == "error":
-                                error_msg = event.get("error", {}).get("message", "Unknown error")
-                                log(f"\nErreur: {error_msg}\n")
-                                # Envoyer l'erreur au step actuel
-                                if current_step:
-                                    await send_step_log(current_step, f"Error: {error_msg}", "stderr")
-                                    await send_step_complete(current_step, "failure", f"## Error\n\n{error_msg}")
-                                await send_action_complete("failure")
-
-                            messages.append(event)
-
-                        except json.JSONDecodeError:
-                            # Ligne non-JSON, probablement du debug
-                            log(f"{line}\n")
-
-                # Vérifier si le process est terminé
-                if process.poll() is not None:
-                    # Lire les lignes restantes
-                    if process.stdout:
-                        for line in process.stdout:
-                            line = line.strip()
-                            if line:
-                                try:
-                                    messages.append(json.loads(line))
-                                except:
-                                    pass
-                    # Compléter le step en cours si pas encore fait
-                    if current_step and not action_completed:
-                        await send_step_complete(current_step, action_status, "Process completed")
-                        await send_action_complete(action_status)
-                    break
-
-        # Lire stderr
-        if process.stderr:
-            stderr_output = process.stderr.read()
-            if stderr_output:
-                log(f"\n[stderr]: {stderr_output}\n")
-
-        process.wait()
-
+    except websockets.exceptions.WebSocketException as e:
+        log_to_stderr(f"\n❌ WebSocket error: {e}\n")
         return {
-            "success": process.returncode == 0,
-            "result": result_text,
-            "cost": total_cost,
-            "messages": messages,
-            "returncode": process.returncode
+            "success": False,
+            "result": "",
+            "cost": 0.0,
+            "messages": [],
+            "error": f"WebSocket error: {e}"
         }
 
     except Exception as e:
-        log(f"\nErreur: {type(e).__name__}: {e}\n")
+        log_to_stderr(f"\n❌ Error: {type(e).__name__}: {e}\n")
         return {
             "success": False,
             "result": "",
@@ -410,171 +542,36 @@ async def launch_claude_stream_json(
         }
 
 
-def launch_claude_pty(
-    prompt: str,
-    log_callback: Optional[Callable[[str], None]] = None,
-    idle_timeout: int = 120,
-    max_timeout: int = 1800
-) -> str:
-    """
-    Lance Claude avec un PTY pour capturer la sortie formatée en temps réel.
-    Utile pour voir le rendu "humain" avec les couleurs (nettoyées).
+# =============================================================================
+# Point d'entrée pour lancer Claude
+# =============================================================================
 
-    Args:
-        prompt: Le prompt complet à envoyer à Claude
-        log_callback: Fonction appelée pour chaque chunk de sortie
-        idle_timeout: Secondes d'inactivité avant de considérer terminé
-        max_timeout: Timeout maximum total (défaut: 30 minutes)
-
-    Returns:
-        La sortie complète de Claude (nettoyée des codes ANSI)
-    """
-
-    def log(msg: str):
-        if log_callback:
-            log_callback(msg)
-
-    # Créer un pseudo-terminal
-    master_fd, slave_fd = pty.openpty()
-
-    # Configurer les dimensions du terminal
-    winsize = struct.pack('HHHH', 50, 200, 0, 0)
-    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
-
-    full_output = []
-    process = None
-
-    try:
-        cmd = [
-            "claude",
-            "-p", prompt,
-            "--dangerously-skip-permissions"
-        ]
-
-        process = subprocess.Popen(
-            cmd,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            close_fds=True,
-            env={**os.environ, "TERM": "xterm-256color"}
-        )
-
-        os.close(slave_fd)
-        slave_fd = -1
-
-        log("Lancement de Claude (PTY)...\n")
-
-        # Rendre non-bloquant
-        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-        start_time = time.time()
-        last_data_time = time.time()
-
-        while True:
-            elapsed = time.time() - start_time
-            idle_time = time.time() - last_data_time
-
-            if elapsed > max_timeout:
-                log(f"\nTimeout maximum atteint ({max_timeout}s)\n")
-                break
-
-            if idle_time > idle_timeout:
-                log(f"\nFin détectée (inactivité de {idle_timeout}s)\n")
-                break
-
-            if process.poll() is not None:
-                # Lire les données restantes
-                time.sleep(0.2)
-                try:
-                    remaining = os.read(master_fd, 65536).decode('utf-8', errors='replace')
-                    if remaining:
-                        clean = strip_ansi(remaining)
-                        full_output.append(clean)
-                        log(clean)
-                except:
-                    pass
-                log("\nProcess Claude terminé\n")
-                break
-
-            try:
-                readable, _, _ = select.select([master_fd], [], [], 0.5)
-            except select.error:
-                break
-
-            if readable:
-                try:
-                    data = os.read(master_fd, 4096).decode('utf-8', errors='replace')
-                    if data:
-                        clean = strip_ansi(data)
-                        full_output.append(clean)
-                        log(clean)
-                        last_data_time = time.time()
-                except BlockingIOError:
-                    pass
-                except OSError as e:
-                    if e.errno == 5:  # Input/output error
-                        break
-                    raise
-
-    except Exception as e:
-        log(f"\nErreur: {type(e).__name__}: {e}\n")
-        import traceback
-        log(traceback.format_exc())
-
-    finally:
-        if slave_fd != -1:
-            try:
-                os.close(slave_fd)
-            except:
-                pass
-
-        if process and process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=5)
-            except:
-                try:
-                    process.kill()
-                except:
-                    pass
-
-        try:
-            os.close(master_fd)
-        except:
-            pass
-
-    return "".join(full_output)
-
-
-def launch_claude_process(
-    request,
-    verbosity: int = 1
-) -> None:
+def launch_claude_process(request, verbosity: int = 1) -> Optional[dict]:
     """
     Lance Claude avec le prompt d'analyse (analyze_py.md).
+    Point d'entrée synchrone qui lance la coroutine async.
 
     Args:
-        log_callback: Fonction pour le streaming des logs (optionnel)
-        use_stream_json: Utiliser le mode stream-json (recommandé) ou PTY
-        verbosity: Niveau de verbosité (0=minimal, 1=normal, 2=debug JSON)
+        request: L'objet request avec les infos du job
+        verbosity: Niveau de verbosité
 
     Returns:
-        La sortie complète ou le résultat
+        Le résultat du process Claude ou None si erreur
     """
     prompt_path = Path(".claude/commands/analyze_py.md")
 
     if not prompt_path.exists():
-        print(f"Fichier prompt non trouvé: {prompt_path}")
+        log_to_stderr(f"❌ Fichier prompt non trouvé: {prompt_path}\n")
         return None
 
     prompt = prompt_path.read_text()
 
-    if (request.action == 'issue_detector'):
-        asyncio.run(launch_claude_stream_json(
+    if request.action == 'issue_detector':
+        return asyncio.run(launch_claude_stream_json(
             prompt=prompt,
             request=request,
-            max_timeout=1800,
+            max_timeout=7200,
             verbosity=verbosity
         ))
+
+    return None
