@@ -1,412 +1,778 @@
----
-name: security
-description: |
-  Audit de sécurité du code. Détecte les vulnérabilités et les RÉGRESSIONS de bugs passés.
-  Utiliser PROACTIVEMENT pour tout code touchant à la sécurité, l'authentification, les entrées utilisateur.
-  DOIT ÊTRE UTILISÉ avant de merger du code sensible.
-  Exemples :
-  - "Vérifie la sécurité de ce code"
-  - "Y a-t-il des vulnérabilités ?"
-  - "Est-ce une régression d'un bug passé ?"
-tools: Read, Grep, Glob, Bash
-model: opus
----
+# Security Report
 
-# Agent SECURITY
+## AgentDB Data Used
 
-Tu es un expert en sécurité logicielle. Ta mission est de détecter les vulnérabilités et **surtout les RÉGRESSIONS** de bugs passés en utilisant **OBLIGATOIREMENT** AgentDB.
-
-## RÈGLE ABSOLUE
-
-**Tu DOIS vérifier l'historique des bugs (error_history) EN PREMIER.** Les régressions sont CRITIQUES. Un bug qui réapparaît après avoir été corrigé est plus grave qu'un nouveau bug.
-
-## Mode Verbose
-
-Si l'utilisateur demande le mode verbose (`--verbose` ou `VERBOSE=1`), affiche :
-- Chaque commande query.sh exécutée
-- Les données JSON brutes retournées (notamment error_history)
-- Ton raisonnement pour la détection des patterns similaires
-
-## Accès à AgentDB
-
-```bash
-# TOUJOURS utiliser AGENTDB_CALLER pour l'identification
-export AGENTDB_CALLER="security"
-
-# Commandes disponibles (TOUTES retournent du JSON)
-bash .claude/agentdb/query.sh error_history "path/file.cpp" [days]  # CRITIQUE: Bugs passés
-bash .claude/agentdb/query.sh file_context "path/file.cpp"          # Contexte + security_sensitive
-bash .claude/agentdb/query.sh patterns "" "security"                # Patterns de sécurité
-bash .claude/agentdb/query.sh symbol_callers "funcName"             # Propagation de vulnérabilités
-bash .claude/agentdb/query.sh list_critical_files                   # Fichiers sensibles
-```
-
-## Gestion des erreurs AgentDB
-
-Chaque query peut retourner une erreur ou des données vides. Voici comment les gérer :
-
-| Situation | Détection | Action | Impact sur rapport |
-|-----------|-----------|--------|-------------------|
-| **DB inaccessible** | `"error"` dans JSON | Continuer sans AgentDB | Marquer `❌ ERROR` + pénalité -10 |
-| **Fichier non indexé** | `"file not found"` ou résultat vide | Scanner le code manuellement | Marquer `⚠️ NOT INDEXED` |
-| **Pas d'historique** | error_history vide | OK si projet nouveau | Marquer `⚠️ NO HISTORY` |
-| **Query timeout** | Pas de réponse après 30s | Retry 1x, puis skip | Marquer `⚠️ TIMEOUT` |
-
-**Template de vérification** :
-```bash
-result=`AGENTDB_CALLER="security" bash .claude/agentdb/query.sh error_history "path/file.cpp" 365`
-
-# Vérifier si erreur
-if echo "$result" | grep -q '"error"'; then
-    echo "AgentDB error - scanning manually"
-fi
-
-# Vérifier si vide (OK pour error_history si projet nouveau)
-if [ "$result" = "[]" ] || [ -z "$result" ]; then
-    echo "No bug history - project may be new or error_history not populated"
-fi
-```
-
-**Règle CRITIQUE** : Pour la sécurité, l'absence de données AgentDB ne doit PAS empêcher le scan. Toujours scanner le code avec grep pour les patterns dangereux (strcpy, system, etc.) même si AgentDB est vide.
-
-## Méthodologie OBLIGATOIRE
-
-### Pré-requis : Utiliser le contexte fourni
-
-**IMPORTANT** : Tu reçois le contexte du diff depuis le prompt de `/analyze`. Le prompt te fournit :
-- La liste des fichiers modifiés (entre LAST_COMMIT et HEAD)
-- Le type d'analyse (diff unifié)
-
-Utilise cette liste pour itérer sur les fichiers, ne fais PAS ton propre `git diff HEAD~1`.
-
-### Étape 1 : VÉRIFIER L'HISTORIQUE (CRITIQUE)
-
-```bash
-# OBLIGATOIRE EN PREMIER : Récupérer les bugs passés sur 365 jours
-# Pour CHAQUE fichier de la liste fournie dans le prompt
-AGENTDB_CALLER="security" bash .claude/agentdb/query.sh error_history "path/to/file.cpp" 365
-```
-
-**Analyser chaque bug passé** :
-- Quel était le type d'erreur ?
-- Quel code a été corrigé ?
-- Le nouveau code ressemble-t-il au code buggé ?
-
-### Étape 2 : Vérifier si le fichier est sensible
-
-```bash
-# Le fichier est-il marqué security_sensitive ?
-AGENTDB_CALLER="security" bash .claude/agentdb/query.sh file_context "path/to/file.cpp"
-
-# Lister tous les fichiers critiques du projet
-AGENTDB_CALLER="security" bash .claude/agentdb/query.sh list_critical_files
-```
-
-### Étape 3 : Charger les patterns de sécurité
-
-```bash
-AGENTDB_CALLER="security" bash .claude/agentdb/query.sh patterns "" "security"
-```
-
-### Étape 4 : Scanner le code pour vulnérabilités
-
-```bash
-# Memory safety (C/C++)
-grep -n "strcpy\|sprintf\|gets\|strcat\|scanf" path/to/file.cpp
-
-# Command injection
-grep -n "system\|popen\|exec" path/to/file.cpp
-
-# Path traversal
-grep -n "fopen\|open\|readFile" path/to/file.cpp
-
-# SQL injection (si applicable)
-grep -n "query\|execute\|sql" path/to/file.cpp
-
-# Hardcoded credentials
-grep -n "password\|secret\|api_key\|token" path/to/file.cpp
-```
-
-### Étape 5 : Tracer la propagation des vulnérabilités
-
-```bash
-# Si une fonction vulnérable est trouvée, qui l'appelle ?
-AGENTDB_CALLER="security" bash .claude/agentdb/query.sh symbol_callers "vulnerableFunction"
-```
-
-## Base de connaissances CWE
-
-### Sévérités utilisées (format site web)
-
-| Sévérité | Description | Exemples |
-|----------|-------------|----------|
-| **Blocker** | Bloque le déploiement, crash certain | Use-after-free, buffer overflow exploitable |
-| **Critical** | Très grave, nécessite correction immédiate | Injection SQL, commandes système |
-| **Major** | Impact significatif | Path traversal, validation manquante |
-| **Medium** | Impact modéré | Retours non vérifiés |
-| **Minor** | Impact faible | Bonnes pratiques non suivies |
-| **Info** | Information | Suggestions d'amélioration |
-
-### Memory Safety (C/C++)
-
-| Pattern dangereux | CWE | Sévérité | isBug? | Correction |
-|-------------------|-----|----------|--------|------------|
-| `strcpy(dst, src)` | CWE-120 | Critical | ✅ Oui (crash) | `strncpy(dst, src, sizeof(dst)-1); dst[sizeof(dst)-1]='\0';` |
-| `sprintf(buf, fmt, ...)` | CWE-120 | Critical | ✅ Oui (crash) | `snprintf(buf, sizeof(buf), fmt, ...)` |
-| `gets(buf)` | CWE-120 | Blocker | ✅ Oui (crash) | `fgets(buf, sizeof(buf), stdin)` |
-| `strcat(dst, src)` | CWE-120 | Critical | ✅ Oui (crash) | `strncat(dst, src, sizeof(dst)-strlen(dst)-1)` |
-| `scanf("%s", buf)` | CWE-120 | Critical | ✅ Oui (crash) | `scanf("%99s", buf)` avec limite |
-| `free(ptr); use(ptr)` | CWE-416 | Blocker | ✅ Oui (crash) | `free(ptr); ptr=NULL;` |
-| `malloc` sans check | CWE-476 | Major | ✅ Oui (crash si NULL) | `if (ptr == NULL) { handle_error(); }` |
-
-### Injection
-
-| Pattern dangereux | CWE | Sévérité | isBug? | Correction |
-|-------------------|-----|----------|--------|------------|
-| `system(user_input)` | CWE-78 | Blocker | ❌ Non | Valider/sanitizer l'input, éviter system() |
-| `popen(user_input, ...)` | CWE-78 | Blocker | ❌ Non | Utiliser execvp() avec args séparés |
-| `exec*(user_input)` | CWE-78 | Blocker | ❌ Non | Whitelist des commandes autorisées |
-| `sql_query(user_input)` | CWE-89 | Blocker | ❌ Non | Requêtes préparées (parameterized queries) |
-| `eval(user_input)` | CWE-94 | Blocker | ❌ Non | Ne jamais eval du contenu utilisateur |
-
-### Path Traversal
-
-| Pattern dangereux | CWE | Sévérité | isBug? | Correction |
-|-------------------|-----|----------|--------|------------|
-| `open(user_path)` | CWE-22 | Critical | ❌ Non | Vérifier que le path est dans le répertoire autorisé |
-| `include(user_file)` | CWE-22 | Blocker | ❌ Non | Whitelist des fichiers autorisés |
-| Path avec `..` | CWE-22 | Critical | ❌ Non | Normaliser et vérifier le path final |
-
-### Credentials
-
-| Pattern dangereux | CWE | Sévérité | isBug? | Correction |
-|-------------------|-----|----------|--------|------------|
-| `password = "..."` | CWE-798 | Blocker | ❌ Non | Variables d'environnement ou vault |
-| `api_key = "..."` | CWE-798 | Blocker | ❌ Non | Fichier de config sécurisé |
-| `if (pass == "admin")` | CWE-798 | Blocker | ❌ Non | Hash comparison avec timing-safe |
-
-### Définition de isBug
-
-Un finding a `isBug: true` **uniquement** s'il provoque un **arrêt brutal de l'application** :
-- ✅ Crash (segfault, exception non gérée)
-- ✅ Gel (freeze, boucle infinie)
-- ✅ Fermeture inopinée
-
-**Ce n'est PAS un bug** si l'application reste fonctionnelle malgré le problème :
-- ❌ Vulnérabilité de sécurité (données exposées mais app fonctionne)
-- ❌ Résultats incorrects
-- ❌ Fuite mémoire progressive
-
-## Détection des Régressions
-
-### Algorithme
-
-```
-Pour chaque bug passé dans error_history :
-    1. Extraire le pattern du bug (ex: "strcpy sans bounds check")
-    2. Chercher ce pattern dans le nouveau code
-    3. Si trouvé :
-       - Comparer les lignes de code
-       - Si similaire → RÉGRESSION DÉTECTÉE
-       - Sévérité = CRITICAL
-       - Référencer le bug original (date, resolution)
-```
-
-### Exemple de régression
-
-```markdown
-#### 🔴 [CRITICAL] SEC-001 : RÉGRESSION DÉTECTÉE
-
-**Bug original** : #BUG-456 du 2025-10-15
-- **Type** : buffer_overflow
-- **Fichier original** : src/server/UDPServer.cpp:45
-- **Code buggé** : `strcpy(buffer, input);`
-- **Correction appliquée** : `strncpy(buffer, input, sizeof(buffer)-1);`
-
-**Nouveau code suspect** : src/server/UDPServer.cpp:67
-```cpp
-// NOUVEAU CODE (ligne 67) - SIMILAIRE AU BUG CORRIGÉ
-strcpy(response_buffer, user_data);
-```
-
-**Analyse** : Le nouveau code utilise `strcpy` sans bounds check, exactement comme le bug #BUG-456 qui a été corrigé le 15/10.
-
-**Action BLOQUANTE** : Remplacer par `strncpy` avant merge.
-```
-
-## Format de sortie OBLIGATOIRE
-
-```markdown
-## 🔒 SECURITY Report
-
-### AgentDB Data Used
 | Query | Status | Results |
 |-------|--------|---------|
-| error_history | ✅ | 3 bugs found (1 security-related) |
-| file_context | ✅ | security_sensitive=true |
-| patterns | ✅ | 5 security patterns loaded |
-| symbol_callers | ✅ | 4 callers traced |
-| list_critical_files | ⚠️ EMPTY | no critical files defined |
+| error_history | ERROR (jq missing) | Unable to query - manual scan performed |
+| file_context | ERROR (jq missing) | Unable to query - manual scan performed |
+| patterns | ERROR (jq missing) | Unable to query - using built-in CWE database |
+| symbol_callers | ERROR (jq missing) | Unable to trace - manual code review performed |
+| list_critical_files | ERROR (jq missing) | Unable to list - all C files treated as critical |
 
-### Summary
-- **Score** : 45/100 (🔴 CRITICAL issues found)
-- **Vulnérabilités** : 3
-- **Régressions** : 1 ⚠️
-- **Sévérité max** : CRITICAL
-- **CWEs référencés** : CWE-120, CWE-78
+**Note**: AgentDB queries failed due to missing `jq` dependency. Security scan performed manually with grep-based pattern detection.
 
-### Bug History Analysis
+## Summary
+
+- **Score**: 0/100 (BLOCKER issues found)
+- **Vulnerabilities**: 23
+- **Regressions**: N/A (error_history unavailable)
+- **Severity max**: Blocker
+- **CWEs references**: CWE-78, CWE-89, CWE-120, CWE-134, CWE-252, CWE-416, CWE-476, CWE-798, CWE-22
+
+## Bug History Analysis
 
 | Bug ID | Date | Type | Severity | Status | Relevant? |
 |--------|------|------|----------|--------|-----------|
-| #BUG-456 | 2025-10-15 | buffer_overflow | high | resolved | ⚠️ PATTERN SIMILAR |
-| #BUG-123 | 2025-09-01 | sql_injection | critical | resolved | ✅ Not related |
+| N/A | - | - | - | - | AgentDB unavailable |
 
-### Vulnerabilities
+## Vulnerabilities
 
-#### 🔴 [Blocker] SEC-001 : RÉGRESSION - Buffer Overflow (CWE-120)
+---
 
-- **Catégorie** : Security
-- **Fichier** : src/server/UDPServer.cpp:67
-- **Fonction** : `processRequest()`
-- **Bug similaire** : #BUG-456 (2025-10-15)
-- **isBug** : ✅ Oui (provoque un crash - segmentation fault)
+### [Blocker] SEC-001: Command Injection via popen (CWE-78)
 
-**Code actuel** :
-```cpp
-void processRequest(const char* user_data) {
-    char response_buffer[256];
-    strcpy(response_buffer, user_data);  // ⚠️ DANGER: No bounds check
-    // ...
-}
-```
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/connection.c:130`
+- **Function**: `handle_connection()`
+- **isBug**: No (vulnerability, app does not crash)
 
-**Correction suggérée** :
-```cpp
-void processRequest(const char* user_data) {
-    char response_buffer[256];
-    strncpy(response_buffer, user_data, sizeof(response_buffer) - 1);
-    response_buffer[sizeof(response_buffer) - 1] = '\0';
-    // ...
-}
-```
-
-- **Temps estimé** : ~5 min
-- **Bloquant** : ✅ OUI (régression)
-- **Référence** : https://cwe.mitre.org/data/definitions/120.html
-
-#### 🔴 [Blocker] SEC-002 : Command Injection potentielle (CWE-78)
-
-- **Catégorie** : Security
-- **Fichier** : src/utils/Shell.cpp:34
-- **Fonction** : `executeCommand()`
-- **isBug** : ❌ Non (vulnérabilité, mais l'app ne crash pas)
-
-**Code actuel** :
-```cpp
-void executeCommand(const std::string& cmd) {
-    system(cmd.c_str());  // ⚠️ DANGER: Direct system call
-}
-```
-
-**Correction suggérée** :
-```cpp
-void executeCommand(const std::string& cmd) {
-    // Whitelist des commandes autorisées
-    static const std::set<std::string> allowed = {"ls", "pwd", "date"};
-    if (allowed.find(cmd) == allowed.end()) {
-        throw std::runtime_error("Command not allowed");
-    }
-    // Utiliser execvp avec args séparés plutôt que system()
-    // ...
-}
-```
-
-- **Temps estimé** : ~20 min
-- **Bloquant** : ✅ OUI (CWE-78 = vulnérabilité critique)
-- **Propagation** : 4 fonctions appellent `executeCommand`
-
-#### 🟡 [Medium] SEC-003 : Retour non vérifié (CWE-252)
-
-- **Catégorie** : Reliability
-- **Fichier** : src/server/UDPServer.cpp:89
-- **Fonction** : `sendResponse()`
-- **isBug** : ❌ Non (erreur silencieuse, pas de crash)
-
-**Code actuel** :
-```cpp
-void sendResponse(int socket, const char* data) {
-    send(socket, data, strlen(data), 0);  // Retour ignoré
-}
-```
-
-**Correction suggérée** :
-```cpp
-void sendResponse(int socket, const char* data) {
-    ssize_t sent = send(socket, data, strlen(data), 0);
-    if (sent < 0) {
-        perror("send failed");
-        // Handle error appropriately
+**Code actuel**:
+```c
+else if (strcmp(path, "/exec") == 0) {
+    if (strlen(body) > 0) {
+        char output[2048];
+        FILE* pipe = popen(body, "r");  // DANGER: Direct execution of user input
+        if (pipe != NULL) {
+            size_t len = fread(output, 1, sizeof(output) - 1, pipe);
+            output[len] = '\0';
+            pclose(pipe);
+            sprintf(response, "HTTP/1.1 200 OK\r\n\r\n%s", output);
+        }
     }
 }
 ```
 
-- **Temps estimé** : ~5 min
-- **Bloquant** : Non
+**Localisation**: The `/exec` endpoint accepts POST requests and passes the body directly to `popen()` for command execution. This allows any remote attacker to execute arbitrary system commands.
 
-### Security Patterns Check
+**Pourquoi c'est critique**:
+
+```mermaid
+sequenceDiagram
+    participant Attacker
+    participant Server
+    participant System
+
+    Attacker->>Server: POST /exec with body "rm -rf /"
+    Server->>System: popen("rm -rf /", "r")
+    System-->>Server: Command executed
+    Server-->>Attacker: Output returned
+    Note over System: System compromised
+```
+
+| Risk | Probability | Impact |
+|------|-------------|--------|
+| Remote Code Execution | High | Critical |
+| Data exfiltration | High | Critical |
+| System compromise | High | Critical |
+
+- **Time estimate**: ~30 min
+- **Blocking**: YES
+- **Reference**: https://cwe.mitre.org/data/definitions/78.html
+
+---
+
+### [Blocker] SEC-002: Command Injection via system() (CWE-78)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/shell/command.c:13-14`
+- **Function**: `execute_command()`
+- **isBug**: No
+
+**Code actuel**:
+```c
+int execute_command(const char* cmd) {
+    return system(cmd);  // DANGER: No input validation
+}
+```
+
+**Additional occurrences**:
+- Line 21: `execute_with_args()` - sprintf + system
+- Line 27: `run_script()` - sprintf + popen
+- Line 49: `admin_execute()` - strcpy + system
+- Line 59: `debug_exec()` - snprintf + system
+- Line 66: `evaluate_expression()` - sprintf + system
+- Line 84: `batch_execute()` - system in loop
+
+**Pourquoi c'est critique**:
+
+```mermaid
+graph TD
+    A[User Input] --> B[execute_command]
+    A --> C[admin_execute]
+    A --> D[debug_exec]
+    A --> E[evaluate_expression]
+    B --> F[system]
+    C --> F
+    D --> F
+    E --> F
+    F --> G[Shell Execution]
+    G --> H[Full System Access]
+```
+
+- **Time estimate**: ~2 hours (8 functions to secure)
+- **Blocking**: YES
+
+---
+
+### [Blocker] SEC-003: Hardcoded Credentials (CWE-798)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/config/config.c:12-21`
+- **Function**: Global declarations
+- **isBug**: No
+
+**Code actuel**:
+```c
+static const char* ADMIN_USERNAME = "admin";
+static const char* ADMIN_PASSWORD = "password123";
+static const char* BACKUP_PASSWORD = "backup_admin_2024";
+static const char* ROOT_TOKEN = "root_access_token_xyz";
+
+static const char* DATABASE_CONNECTION_STRING =
+    "postgresql://admin:SuperSecret123@db.example.com:5432/production";
+static const char* AWS_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE";
+static const char* AWS_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+static const char* PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----";
+```
+
+**Also in config.h**:
+```c
+#define DB_PASSWORD "admin123"
+#define API_SECRET_KEY "sk_live_abc123xyz789"
+#define ENCRYPTION_KEY "my_secret_key_123"
+```
+
+**Pourquoi c'est critique**:
+
+```mermaid
+graph LR
+    A[Source Code] --> B[Git Repository]
+    B --> C[Public Access]
+    C --> D[Attacker]
+    D --> E[Database Access]
+    D --> F[AWS Access]
+    D --> G[Admin Access]
+```
+
+| Credential | Risk |
+|------------|------|
+| Admin passwords | Account takeover |
+| Database connection | Data breach |
+| AWS keys | Cloud resource abuse |
+| Private key | Identity impersonation |
+
+- **Time estimate**: ~1 hour
+- **Blocking**: YES
+
+---
+
+### [Blocker] SEC-004: SQL Injection (CWE-89)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/config/config.c:61-64`
+- **Function**: `config_load_from_db()`
+- **isBug**: No
+
+**Code actuel**:
+```c
+int config_load_from_db(const char* config_name) {
+    char query[512];
+    sprintf(query, "SELECT * FROM config WHERE name = '%s'", config_name);
+    printf("Executing: %s\n", query);
+    return 0;
+}
+```
+
+**Pourquoi c'est critique**:
+
+```mermaid
+sequenceDiagram
+    participant Attacker
+    participant App
+    participant Database
+
+    Attacker->>App: config_name = "' OR 1=1; DROP TABLE config;--"
+    App->>Database: SELECT * FROM config WHERE name = '' OR 1=1; DROP TABLE config;--'
+    Database-->>App: All data / Table dropped
+```
+
+- **Time estimate**: ~15 min
+- **Blocking**: YES
+
+---
+
+### [Blocker] SEC-005: gets() - Unsafe Function (CWE-120)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/udp_server.c:96`
+- **Function**: `udp_server_read_input()`
+- **isBug**: YES (will crash with buffer overflow)
+
+**Code actuel**:
+```c
+void udp_server_read_input(char* buffer) {
+    gets(buffer);  // BLOCKER: Never use gets()
+}
+```
+
+**Also in main.c:52**:
+```c
+gets(input);  // Same vulnerability in server mode
+```
+
+**Pourquoi c'est critique**: `gets()` has no buffer size limit. Any input larger than the buffer causes a stack overflow, leading to crash or code execution.
+
+```mermaid
+graph TD
+    A[User Input > Buffer Size] --> B[Stack Overflow]
+    B --> C[Crash - Segfault]
+    B --> D[Code Execution]
+```
+
+- **Time estimate**: ~5 min each
+- **Blocking**: YES
+- **Reference**: https://cwe.mitre.org/data/definitions/120.html
+
+---
+
+### [Blocker] SEC-006: Buffer Overflow via strcpy (CWE-120)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/udp_server.c:51`
+- **Function**: `udp_server_process_request()`
+- **isBug**: YES (crash on large input)
+
+**Code actuel**:
+```c
+int udp_server_process_request(UDPServer* server, const char* client_data) {
+    char response_buffer[256];
+    char temp[64];
+
+    strcpy(response_buffer, client_data);  // DANGER: No bounds check
+    sprintf(temp, "Received: %s", client_data);  // DANGER: temp is only 64 bytes
+    strcat(response_buffer, " - processed");  // DANGER: Adds to overflow
+```
+
+**Other strcpy occurrences**:
+- `udp_server.c:108,118` - `udp_server_process_batch()`
+- `connection.c:55` - `parse_request()`
+- `file_ops.c:19` - `file_read()` (g_last_error)
+- `memory.c:97-99` - `process_data_buffer()`
+- `string_utils.c:20,35-36` - `str_dup()`, `str_concat()`
+- `crypto.c:126-127` - `crypto_derive_key()`
+- `cache.c:89,101` - `cache_set()`
+- `logger.c:195-196` - `log_hex()`
+- `config.c:46` - `admin_execute()`
+
+**Pourquoi c'est critique**:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    participant Stack
+
+    Client->>Server: UDP packet with 500 bytes
+    Server->>Stack: strcpy to 256-byte buffer
+    Note over Stack: Overflow!
+    Stack-->>Server: Segmentation Fault
+    Server->>Client: Connection lost
+```
+
+- **Time estimate**: ~2 hours (15+ occurrences)
+- **Blocking**: YES
+
+---
+
+### [Blocker] SEC-007: Path Traversal (CWE-22)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/connection.c:88-102`
+- **Function**: `handle_connection()`
+- **isBug**: No
+
+**Code actuel**:
+```c
+if (strncmp(path, "/file/", 6) == 0) {
+    char filepath[512];
+    sprintf(filepath, "/var/data%s", path + 5);  // No path validation!
+
+    FILE* fp = fopen(filepath, "r");
+    // ...
+}
+```
+
+**Attack example**: `GET /file/../../../etc/passwd` reads `/var/data/../../../etc/passwd` = `/etc/passwd`
+
+**Also vulnerable**:
+- `file_ops.c:82` - `file_include()`: `/var/app/includes/%s`
+- `connection.c:147` - `/upload` endpoint allows arbitrary file writes
+
+**Pourquoi c'est critique**:
+
+```mermaid
+graph TD
+    A["/file/../../../etc/passwd"] --> B[sprintf]
+    B --> C["/var/data/../../../etc/passwd"]
+    C --> D[realpath = /etc/passwd]
+    D --> E[Sensitive File Exposed]
+```
+
+- **Time estimate**: ~30 min
+- **Blocking**: YES
+
+---
+
+### [Blocker] SEC-008: Arbitrary File Write (CWE-22)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/connection.c:141-154`
+- **Function**: `handle_connection()` - /upload
+- **isBug**: No
+
+**Code actuel**:
+```c
+else if (strcmp(path, "/upload") == 0) {
+    char filename[256];
+    if (sscanf(body, "filename=%255s&", filename) == 1) {
+        char* content = strstr(body, "&content=");
+        if (content != NULL) {
+            content += 9;
+            FILE* fp = fopen(filename, "w");  // Arbitrary path!
+            if (fp != NULL) {
+                fwrite(content, 1, strlen(content), fp);
+```
+
+**Attack**: `POST /upload` with body `filename=/etc/cron.d/backdoor&content=...`
+
+- **Time estimate**: ~15 min
+- **Blocking**: YES
+
+---
+
+### [Critical] SEC-009: Hardcoded Password Bypass (CWE-798)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/connection.c:117-118`
+- **Function**: `handle_connection()`
+- **isBug**: No
+
+**Code actuel**:
+```c
+if (strcmp(password, "admin123") == 0 ||
+    strcmp(username, "debug") == 0) {  // Any password with user "debug"
+    conn->authenticated = 1;
+```
+
+- **Time estimate**: ~10 min
+- **Blocking**: YES
+
+---
+
+### [Critical] SEC-010: Use-After-Free (CWE-416)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/udp_server.c:134-138`
+- **Function**: `udp_server_cleanup()`
+- **isBug**: YES (crash)
+
+**Code actuel**:
+```c
+void udp_server_cleanup(UDPServer* server) {
+    if (server->buffer) {
+        free(server->buffer);
+        memset(server->buffer, 0, server->buffer_size);  // USE AFTER FREE!
+    }
+```
+
+**Also in cache.c:136**:
+```c
+free(entry);
+// ...
+printf("Deleted cache entry: %s\n", entry->key);  // USE AFTER FREE!
+```
+
+- **Time estimate**: ~10 min
+- **Blocking**: YES
+
+---
+
+### [Critical] SEC-011: Format String Vulnerability (CWE-134)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/udp_server.c:146`
+- **Function**: `udp_server_log()`
+- **isBug**: No (but exploitable)
+
+**Code actuel**:
+```c
+void udp_server_log(const char* message) {
+    printf(message);  // DANGER: message may contain format specifiers
+}
+```
+
+**Attack**: If `message` contains `%n`, attacker can write to memory.
+
+- **Time estimate**: ~5 min
+- **Blocking**: YES
+
+---
+
+### [Critical] SEC-012: scanf Without Bounds (CWE-120)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/udp_server.c:152`
+- **Function**: `udp_server_get_command()`
+- **isBug**: YES (crash on long input)
+
+**Code actuel**:
+```c
+void udp_server_get_command(char* cmd) {
+    printf("Enter command: ");
+    scanf("%s", cmd);  // No size limit
+}
+```
+
+**Also in main.c:130,141,147**:
+```c
+scanf("%s", input);  // All vulnerable
+```
+
+- **Time estimate**: ~15 min
+- **Blocking**: YES
+
+---
+
+### [Critical] SEC-013: Weak Cryptography (CWE-327)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/utils/crypto.c`
+- **Function**: Multiple
+- **isBug**: No
+
+**Issues**:
+1. XOR "encryption" is not encryption (line 15-31)
+2. Simple hash function is collision-prone (line 40-51)
+3. `rand()` for "random" bytes is predictable (line 78-82)
+
+**Code actuel**:
+```c
+// XOR-based "encryption" - simple and fast
+char* crypto_encrypt(const char* plaintext, const char* key) {
+    // ...
+    ciphertext[i] = plaintext[i] ^ key[i % key_len];  // NOT ENCRYPTION
+```
+
+```c
+void crypto_random_bytes(char* buffer, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        buffer[i] = (char)(rand() % 256);  // PREDICTABLE
+    }
+}
+```
+
+- **Time estimate**: ~4 hours (requires proper crypto library)
+- **Blocking**: YES for sensitive data
+
+---
+
+### [Major] SEC-014: Memory Leak in process_data_buffer (CWE-401)
+
+- **Category**: Reliability
+- **File**: `/home/simia/dev/corpo/cre/flow/src/utils/memory.c:81-104`
+- **Function**: `process_data_buffer()`
+- **isBug**: No (leak, not crash)
+
+**Code actuel**:
+```c
+int process_data_buffer(const char* input) {
+    char* buffer1 = malloc(256);
+    if (buffer1 == NULL) return -1;
+
+    char* buffer2 = malloc(256);
+    if (buffer2 == NULL) return -1;  // buffer1 leaks
+
+    char* buffer3 = malloc(256);
+    if (buffer3 == NULL) return -1;  // buffer1, buffer2 leak
+
+    // ... uses strcpy (buffer overflow)
+
+    free(buffer3);
+    // buffer1, buffer2 never freed!
+    return 0;
+}
+```
+
+- **Time estimate**: ~10 min
+- **Blocking**: No
+
+---
+
+### [Major] SEC-015: NULL Dereference (CWE-476)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/utils/memory.c:122-124`
+- **Function**: `alloc_zeroed()`
+- **isBug**: YES (crash if malloc returns NULL)
+
+**Code actuel**:
+```c
+void* alloc_zeroed(size_t size) {
+    void* ptr = malloc(size);
+    memset(ptr, 0, size);  // ptr may be NULL!
+    return ptr;
+}
+```
+
+**Other unchecked malloc returns**:
+- `crypto.c:23,61,88,125,134,142,156,171,178`
+- `string_utils.c:19,34,111,121,140,163,178`
+- `validator.c:55,180`
+- `logger.c:193`
+
+- **Time estimate**: ~1 hour
+- **Blocking**: YES (crash)
+
+---
+
+### [Major] SEC-016: Unchecked Return Values (CWE-252)
+
+- **Category**: Reliability
+- **File**: `/home/simia/dev/corpo/cre/flow/src/server/udp_server.c:91`
+- **Function**: `udp_server_send_response()`
+- **isBug**: No
+
+**Code actuel**:
+```c
+void udp_server_send_response(int socket, const char* data) {
+    send(socket, data, strlen(data), 0);  // Return value ignored
+}
+```
+
+- **Time estimate**: ~5 min
+- **Blocking**: No
+
+---
+
+### [Major] SEC-017: Off-By-One in str_build (CWE-193)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/utils/string_utils.c:134`
+- **Function**: `str_build()`
+- **isBug**: YES (reads past array bounds)
+
+**Code actuel**:
+```c
+char* str_build(const char** parts, int count) {
+    size_t total_len = 0;
+    for (int i = 0; i <= count; i++) {  // BUG: should be i < count
+        if (parts[i] != NULL) {
+            total_len += strlen(parts[i]);
+        }
+    }
+```
+
+- **Time estimate**: ~5 min
+- **Blocking**: YES
+
+---
+
+### [Major] SEC-018: Buffer Underallocation (CWE-122)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/utils/cache.c:88`
+- **Function**: `cache_set()`
+- **isBug**: YES (heap overflow)
+
+**Code actuel**:
+```c
+entry->value = malloc(strlen(value));  // Missing +1 for null terminator
+strcpy(entry->value, value);  // Writes strlen(value)+1 bytes
+```
+
+- **Time estimate**: ~5 min
+- **Blocking**: YES
+
+---
+
+### [Medium] SEC-019: str_safe_copy Not Null-Terminated (CWE-170)
+
+- **Category**: Reliability
+- **File**: `/home/simia/dev/corpo/cre/flow/src/utils/string_utils.c:42-44`
+- **Function**: `str_safe_copy()`
+- **isBug**: No (may cause undefined behavior)
+
+**Code actuel**:
+```c
+void str_safe_copy(char* dst, const char* src, size_t size) {
+    strncpy(dst, src, size);  // Does not guarantee null termination
+}
+```
+
+- **Time estimate**: ~5 min
+- **Blocking**: No
+
+---
+
+### [Medium] SEC-020: Memory Leak in str_process_complex (CWE-401)
+
+- **Category**: Reliability
+- **File**: `/home/simia/dev/corpo/cre/flow/src/utils/string_utils.c:117-125`
+- **Function**: `str_process_complex()`
+- **isBug**: No
+
+**Code actuel**:
+```c
+char* str_process_complex(const char* input) {
+    char* temp1 = str_dup(input);
+    char* temp2 = str_concat(temp1, "_suffix");
+    // temp1 never freed!
+    // temp2 never freed!
+    char* result = malloc(strlen(temp2) + 10);
+    sprintf(result, "[%s]", temp2);
+    return result;
+}
+```
+
+- **Time estimate**: ~5 min
+- **Blocking**: No
+
+---
+
+### [Medium] SEC-021: Memory Leak in str_tokenize_and_process (CWE-401)
+
+- **Category**: Reliability
+- **File**: `/home/simia/dev/corpo/cre/flow/src/utils/string_utils.c:153-188`
+- **Function**: `str_tokenize_and_process()`
+- **isBug**: No
+
+- **Time estimate**: ~10 min
+- **Blocking**: No
+
+---
+
+### [Medium] SEC-022: Timing Attack in Password Comparison (CWE-208)
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/config/config.c:36-51`
+- **Function**: `config_authenticate()`
+- **isBug**: No
+
+**Code actuel**:
+```c
+int config_authenticate(const char* username, const char* password) {
+    if (strcmp(username, ADMIN_USERNAME) == 0 &&
+        strcmp(password, ADMIN_PASSWORD) == 0) {  // Timing leak
+```
+
+Note: `crypto.c:99-117` has `crypto_secure_compare()` but it's not used here.
+
+- **Time estimate**: ~10 min
+- **Blocking**: No
+
+---
+
+### [Minor] SEC-023: Debug Mode Enabled by Default
+
+- **Category**: Security
+- **File**: `/home/simia/dev/corpo/cre/flow/src/config/config.c:30`
+- **Function**: `config_init()`
+- **isBug**: No
+
+**Code actuel**:
+```c
+config->debug_mode = 1;  // Debug enabled in production
+```
+
+Also `config_debug_dump()` prints all credentials to stdout.
+
+- **Time estimate**: ~5 min
+- **Blocking**: No
+
+---
+
+## Security Patterns Check
 
 | Pattern | Status | Details |
 |---------|--------|---------|
-| memory_safety | ❌ FAIL | 2 violations (strcpy, strcat) |
-| input_validation | ⚠️ WARN | user_data not sanitized |
-| error_handling | ⚠️ WARN | 3 unchecked returns |
-| credentials | ✅ PASS | No hardcoded secrets |
+| memory_safety | FAIL | 15+ strcpy/sprintf/gets violations |
+| input_validation | FAIL | system(), popen() with user input |
+| error_handling | WARN | malloc returns unchecked |
+| credentials | FAIL | 10+ hardcoded secrets |
+| path_traversal | FAIL | No path validation on file ops |
+| cryptography | FAIL | XOR encryption, rand() for random |
 
-### Vulnerability Propagation
+## Vulnerability Propagation
 
 ```
-executeCommand (src/utils/Shell.cpp:34) [VULNERABLE: CWE-78]
-├── AdminPanel::runScript (src/admin/Panel.cpp:156)
-│   └── APIHandler::adminAction (src/api/Handler.cpp:89)
-├── Scheduler::executeTask (src/scheduler/Scheduler.cpp:234)
-└── DebugConsole::exec (src/debug/Console.cpp:45)
+execute_command (src/shell/command.c:13) [VULNERABLE: CWE-78]
++-- main.c:55 (exec: prefix)
++-- main.c:70 (--exec argument)
++-- main.c:142 (interactive exec command)
+
+admin_execute (src/shell/command.c:44) [VULNERABLE: CWE-78]
++-- main.c:58 (shell: prefix)
+
+popen (connection.c:130) [VULNERABLE: CWE-78]
++-- /exec endpoint - network exposed
 ```
 
-### Recommendations
+## Recommendations
 
-1. **[BLOQUANT]** Corriger SEC-001 : Régression buffer overflow
-2. **[BLOQUANT]** Corriger SEC-002 : Command injection
-3. **[HAUTE]** Ajouter validation d'input dans processRequest()
-4. **[MOYENNE]** Vérifier les retours de send()
-5. **[BASSE]** Audit des 4 fonctions appelant executeCommand
+1. **[BLOCKER]** Remove `/exec` endpoint entirely (SEC-001)
+2. **[BLOCKER]** Remove all system()/popen() calls with user input (SEC-002)
+3. **[BLOCKER]** Move all credentials to environment variables (SEC-003)
+4. **[BLOCKER]** Use parameterized queries (SEC-004)
+5. **[BLOCKER]** Replace gets() with fgets() (SEC-005)
+6. **[BLOCKER]** Replace strcpy() with strncpy() + null termination (SEC-006)
+7. **[BLOCKER]** Validate and normalize all file paths (SEC-007, SEC-008)
+8. **[BLOCKER]** Fix use-after-free in cleanup functions (SEC-010)
+9. **[BLOCKER]** Use printf("%s", message) instead of printf(message) (SEC-011)
+10. **[CRITICAL]** Check all malloc() return values (SEC-015)
+11. **[CRITICAL]** Use proper cryptographic libraries (OpenSSL, libsodium) (SEC-013)
+12. **[MAJOR]** Fix all memory leaks (SEC-014, SEC-020, SEC-021)
+13. **[MEDIUM]** Use constant-time comparison for authentication (SEC-022)
+14. **[MINOR]** Disable debug mode by default (SEC-023)
 
-### JSON Output (pour synthesis)
+## JSON Output (pour synthesis)
 
 ```json
 {
   "agent": "security",
-  "score": 45,
-  "vulnerabilities": 3,
-  "regressions": 1,
+  "score": 0,
+  "vulnerabilities": 23,
+  "regressions": 0,
   "max_severity": "Blocker",
-  "cwes": ["CWE-120", "CWE-78", "CWE-252"],
+  "cwes": ["CWE-78", "CWE-89", "CWE-120", "CWE-134", "CWE-252", "CWE-416", "CWE-476", "CWE-798", "CWE-22", "CWE-327", "CWE-401", "CWE-193", "CWE-122", "CWE-170", "CWE-208"],
   "findings": [
     {
       "id": "SEC-001",
       "source": ["security"],
       "severity": "Blocker",
       "category": "Security",
-      "isBug": true,
-      "type": "regression",
-      "cwe": "CWE-120",
-      "file": "src/server/UDPServer.cpp",
-      "line": 67,
-      "function": "processRequest",
-      "related_bug": "BUG-456",
-      "message": "RÉGRESSION - Buffer Overflow similaire au bug #BUG-456",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-78",
+      "file": "src/server/connection.c",
+      "line": 130,
+      "function": "handle_connection",
+      "message": "Command Injection via popen() - /exec endpoint executes arbitrary commands",
       "blocking": true,
-      "time_estimate_min": 5
+      "time_estimate_min": 30,
+      "where": "## Localisation de la vulnerabilite\n\nLa vulnerabilite se trouve dans `/home/simia/dev/corpo/cre/flow/src/server/connection.c` a la ligne 130, dans la fonction `handle_connection()`.\n\n```c\nelse if (strcmp(path, \"/exec\") == 0) {\n    if (strlen(body) > 0) {\n        char output[2048];\n        FILE* pipe = popen(body, \"r\");  // DANGER: User input directly executed\n        if (pipe != NULL) {\n            size_t len = fread(output, 1, sizeof(output) - 1, pipe);\n            output[len] = '\\0';\n            pclose(pipe);\n            sprintf(response, \"HTTP/1.1 200 OK\\r\\n\\r\\n%s\", output);\n        }\n    }\n}\n```\n\nCette fonction recoit des requetes HTTP POST sur l'endpoint `/exec` et passe le body directement a `popen()` pour execution. Aucune validation n'est effectuee sur le contenu du body avant execution.",
+      "why": "## Pourquoi c'est un probleme\n\nCette vulnerabilite est **critique** car elle permet l'execution de code arbitraire a distance (RCE - Remote Code Execution).\n\n### Scenario d'attaque\n\n```mermaid\nsequenceDiagram\n    participant Attacker\n    participant Server\n    participant System\n\n    Attacker->>Server: POST /exec\\nbody: rm -rf /\n    Server->>System: popen(\"rm -rf /\", \"r\")\n    System-->>Server: Commande executee\n    Server-->>Attacker: Output retourne\n    Note over System: Systeme compromis\n```\n\n### Impact\n\n| Risque | Probabilite | Impact |\n|--------|-------------|--------|\n| Execution de code arbitraire | Haute | Critique |\n| Exfiltration de donnees | Haute | Critique |\n| Compromission complete du systeme | Haute | Critique |\n| Installation de backdoor | Haute | Critique |\n\n### Reference\n\n- **CWE-78** : Improper Neutralization of Special Elements used in an OS Command",
+      "how": "## Comment corriger\n\n### Solution recommandee\n\nSupprimer completement l'endpoint `/exec` ou implementer une whitelist stricte de commandes autorisees.\n\n```c\n// Option 1: Supprimer l'endpoint (RECOMMANDE)\n// Retirer tout le bloc else if (strcmp(path, \"/exec\") == 0)\n\n// Option 2: Whitelist stricte (si absolument necessaire)\nelse if (strcmp(path, \"/exec\") == 0) {\n    // Liste des commandes autorisees\n    static const char* allowed_commands[] = {\"date\", \"uptime\", \"hostname\", NULL};\n    \n    int allowed = 0;\n    for (int i = 0; allowed_commands[i] != NULL; i++) {\n        if (strcmp(body, allowed_commands[i]) == 0) {\n            allowed = 1;\n            break;\n        }\n    }\n    \n    if (!allowed) {\n        sprintf(response, \"HTTP/1.1 403 Forbidden\\r\\n\\r\\nCommand not allowed\");\n    } else {\n        // Execute only whitelisted command\n        FILE* pipe = popen(body, \"r\");\n        // ...\n    }\n}\n```\n\n### Processus de correction\n\n```mermaid\ngraph LR\n    A[Identifier endpoint] --> B[Evaluer necessite]\n    B --> C{Necessaire?}\n    C -->|Non| D[Supprimer]\n    C -->|Oui| E[Whitelist stricte]\n    E --> F[Tests de securite]\n    D --> F\n    F --> G[Code review]\n```\n\n### Validation\n\n1. Tester que l'endpoint est supprime ou retourne 403 pour commandes non autorisees\n2. Effectuer un test de penetration sur l'endpoint\n3. Verifier avec un scanner de vulnerabilites (OWASP ZAP, Burp Suite)\n\n### References\n\n- [CWE-78](https://cwe.mitre.org/data/definitions/78.html)\n- [OWASP Command Injection](https://owasp.org/www-community/attacks/Command_Injection)"
     },
     {
       "id": "SEC-002",
@@ -416,214 +782,338 @@ executeCommand (src/utils/Shell.cpp:34) [VULNERABLE: CWE-78]
       "isBug": false,
       "type": "vulnerability",
       "cwe": "CWE-78",
-      "file": "src/utils/Shell.cpp",
-      "line": 34,
-      "function": "executeCommand",
-      "message": "Command Injection potentielle",
+      "file": "src/shell/command.c",
+      "line": 13,
+      "function": "execute_command",
+      "message": "Command Injection via system() - 8 functions pass user input to shell",
       "blocking": true,
-      "time_estimate_min": 20,
-      "propagation": 4
+      "time_estimate_min": 120,
+      "propagation": 8
     },
     {
       "id": "SEC-003",
+      "source": ["security"],
+      "severity": "Blocker",
+      "category": "Security",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-798",
+      "file": "src/config/config.c",
+      "line": 12,
+      "function": "global",
+      "message": "10+ hardcoded credentials including passwords, API keys, and AWS secrets",
+      "blocking": true,
+      "time_estimate_min": 60
+    },
+    {
+      "id": "SEC-004",
+      "source": ["security"],
+      "severity": "Blocker",
+      "category": "Security",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-89",
+      "file": "src/config/config.c",
+      "line": 62,
+      "function": "config_load_from_db",
+      "message": "SQL Injection via string concatenation in query",
+      "blocking": true,
+      "time_estimate_min": 15
+    },
+    {
+      "id": "SEC-005",
+      "source": ["security"],
+      "severity": "Blocker",
+      "category": "Security",
+      "isBug": true,
+      "type": "vulnerability",
+      "cwe": "CWE-120",
+      "file": "src/server/udp_server.c",
+      "line": 96,
+      "function": "udp_server_read_input",
+      "message": "gets() usage causes buffer overflow crash",
+      "blocking": true,
+      "time_estimate_min": 5
+    },
+    {
+      "id": "SEC-006",
+      "source": ["security"],
+      "severity": "Blocker",
+      "category": "Security",
+      "isBug": true,
+      "type": "vulnerability",
+      "cwe": "CWE-120",
+      "file": "src/server/udp_server.c",
+      "line": 51,
+      "function": "udp_server_process_request",
+      "message": "15+ strcpy/sprintf without bounds checking cause buffer overflow",
+      "blocking": true,
+      "time_estimate_min": 120
+    },
+    {
+      "id": "SEC-007",
+      "source": ["security"],
+      "severity": "Blocker",
+      "category": "Security",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-22",
+      "file": "src/server/connection.c",
+      "line": 90,
+      "function": "handle_connection",
+      "message": "Path traversal allows reading arbitrary files via /file/ endpoint",
+      "blocking": true,
+      "time_estimate_min": 30
+    },
+    {
+      "id": "SEC-008",
+      "source": ["security"],
+      "severity": "Blocker",
+      "category": "Security",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-22",
+      "file": "src/server/connection.c",
+      "line": 147,
+      "function": "handle_connection",
+      "message": "Arbitrary file write via /upload endpoint",
+      "blocking": true,
+      "time_estimate_min": 15
+    },
+    {
+      "id": "SEC-009",
+      "source": ["security"],
+      "severity": "Critical",
+      "category": "Security",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-798",
+      "file": "src/server/connection.c",
+      "line": 117,
+      "function": "handle_connection",
+      "message": "Hardcoded password bypass: user 'debug' with any password grants access",
+      "blocking": true,
+      "time_estimate_min": 10
+    },
+    {
+      "id": "SEC-010",
+      "source": ["security"],
+      "severity": "Critical",
+      "category": "Security",
+      "isBug": true,
+      "type": "vulnerability",
+      "cwe": "CWE-416",
+      "file": "src/server/udp_server.c",
+      "line": 137,
+      "function": "udp_server_cleanup",
+      "message": "Use-after-free: memset on freed buffer causes crash",
+      "blocking": true,
+      "time_estimate_min": 10
+    },
+    {
+      "id": "SEC-011",
+      "source": ["security"],
+      "severity": "Critical",
+      "category": "Security",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-134",
+      "file": "src/server/udp_server.c",
+      "line": 146,
+      "function": "udp_server_log",
+      "message": "Format string vulnerability: printf(message) allows memory writes",
+      "blocking": true,
+      "time_estimate_min": 5
+    },
+    {
+      "id": "SEC-012",
+      "source": ["security"],
+      "severity": "Critical",
+      "category": "Security",
+      "isBug": true,
+      "type": "vulnerability",
+      "cwe": "CWE-120",
+      "file": "src/server/udp_server.c",
+      "line": 152,
+      "function": "udp_server_get_command",
+      "message": "scanf without bounds check causes buffer overflow",
+      "blocking": true,
+      "time_estimate_min": 15
+    },
+    {
+      "id": "SEC-013",
+      "source": ["security"],
+      "severity": "Critical",
+      "category": "Security",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-327",
+      "file": "src/utils/crypto.c",
+      "line": 15,
+      "function": "crypto_encrypt",
+      "message": "Weak cryptography: XOR encryption and rand() for randomness",
+      "blocking": true,
+      "time_estimate_min": 240
+    },
+    {
+      "id": "SEC-014",
+      "source": ["security"],
+      "severity": "Major",
+      "category": "Reliability",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-401",
+      "file": "src/utils/memory.c",
+      "line": 81,
+      "function": "process_data_buffer",
+      "message": "Memory leak: buffer1 and buffer2 never freed",
+      "blocking": false,
+      "time_estimate_min": 10
+    },
+    {
+      "id": "SEC-015",
+      "source": ["security"],
+      "severity": "Major",
+      "category": "Security",
+      "isBug": true,
+      "type": "vulnerability",
+      "cwe": "CWE-476",
+      "file": "src/utils/memory.c",
+      "line": 122,
+      "function": "alloc_zeroed",
+      "message": "NULL pointer dereference: memset on potentially NULL ptr",
+      "blocking": true,
+      "time_estimate_min": 60
+    },
+    {
+      "id": "SEC-016",
+      "source": ["security"],
+      "severity": "Major",
+      "category": "Reliability",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-252",
+      "file": "src/server/udp_server.c",
+      "line": 91,
+      "function": "udp_server_send_response",
+      "message": "Return value of send() not checked",
+      "blocking": false,
+      "time_estimate_min": 5
+    },
+    {
+      "id": "SEC-017",
+      "source": ["security"],
+      "severity": "Major",
+      "category": "Security",
+      "isBug": true,
+      "type": "vulnerability",
+      "cwe": "CWE-193",
+      "file": "src/utils/string_utils.c",
+      "line": 134,
+      "function": "str_build",
+      "message": "Off-by-one error reads past array bounds",
+      "blocking": true,
+      "time_estimate_min": 5
+    },
+    {
+      "id": "SEC-018",
+      "source": ["security"],
+      "severity": "Major",
+      "category": "Security",
+      "isBug": true,
+      "type": "vulnerability",
+      "cwe": "CWE-122",
+      "file": "src/utils/cache.c",
+      "line": 88,
+      "function": "cache_set",
+      "message": "Heap buffer overflow: malloc(strlen) missing +1 for null terminator",
+      "blocking": true,
+      "time_estimate_min": 5
+    },
+    {
+      "id": "SEC-019",
       "source": ["security"],
       "severity": "Medium",
       "category": "Reliability",
       "isBug": false,
       "type": "vulnerability",
-      "cwe": "CWE-252",
-      "file": "src/server/UDPServer.cpp",
-      "line": 89,
-      "function": "sendResponse",
-      "message": "Retour de send() non vérifié",
+      "cwe": "CWE-170",
+      "file": "src/utils/string_utils.c",
+      "line": 42,
+      "function": "str_safe_copy",
+      "message": "strncpy does not guarantee null termination",
+      "blocking": false,
+      "time_estimate_min": 5
+    },
+    {
+      "id": "SEC-020",
+      "source": ["security"],
+      "severity": "Medium",
+      "category": "Reliability",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-401",
+      "file": "src/utils/string_utils.c",
+      "line": 117,
+      "function": "str_process_complex",
+      "message": "Memory leak: temp1 and temp2 never freed",
+      "blocking": false,
+      "time_estimate_min": 5
+    },
+    {
+      "id": "SEC-021",
+      "source": ["security"],
+      "severity": "Medium",
+      "category": "Reliability",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-401",
+      "file": "src/utils/string_utils.c",
+      "line": 153,
+      "function": "str_tokenize_and_process",
+      "message": "Memory leak: copy and tokens array never freed",
+      "blocking": false,
+      "time_estimate_min": 10
+    },
+    {
+      "id": "SEC-022",
+      "source": ["security"],
+      "severity": "Medium",
+      "category": "Security",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-208",
+      "file": "src/config/config.c",
+      "line": 36,
+      "function": "config_authenticate",
+      "message": "Timing attack: strcmp allows password length guessing",
+      "blocking": false,
+      "time_estimate_min": 10
+    },
+    {
+      "id": "SEC-023",
+      "source": ["security"],
+      "severity": "Minor",
+      "category": "Security",
+      "isBug": false,
+      "type": "vulnerability",
+      "cwe": "CWE-489",
+      "file": "src/config/config.c",
+      "line": 30,
+      "function": "config_init",
+      "message": "Debug mode enabled by default in production",
       "blocking": false,
       "time_estimate_min": 5
     }
   ],
-  "bug_history_analyzed": 3,
-  "patterns_checked": 4,
+  "bug_history_analyzed": 0,
+  "patterns_checked": 6,
   "agentdb_queries": {
-    "error_history": {"status": "ok", "count": 3},
-    "file_context": {"status": "ok", "security_sensitive": true},
-    "patterns": {"status": "ok", "count": 5},
-    "symbol_callers": {"status": "ok", "count": 4}
+    "error_history": {"status": "error", "reason": "jq command not found"},
+    "file_context": {"status": "error", "reason": "jq command not found"},
+    "patterns": {"status": "error", "reason": "jq command not found"},
+    "symbol_callers": {"status": "error", "reason": "jq command not found"},
+    "list_critical_files": {"status": "error", "reason": "jq command not found"}
   }
 }
 ```
-```
-
-## Calcul du Score (0-100)
-
-**Référence** : Les pénalités sont définies dans `.claude/config/agentdb.yaml` section `analysis.security.penalties`
-
-```
-Score = 100 - penalties
-
-Pénalités (valeurs par défaut, voir config pour personnaliser) :
-- Vulnérabilité Blocker : -35 chacune (blocker)
-- Vulnérabilité Critical : -25 chacune (critical)
-- Vulnérabilité Major : -15 chacune (major)
-- Vulnérabilité Medium : -10 chacune (medium)
-- Vulnérabilité Minor : -5 chacune (minor)
-- Vulnérabilité Info : 0 (info)
-- RÉGRESSION détectée : -25 (en plus de la sévérité) (regression)
-- Fichier security_sensitive touché : -10 (sensitive_file)
-- Pattern de sécurité violé : -5 par pattern (pattern_violated)
-- AgentDB error_history non consulté : 0 (no_error_history - pas de pénalité si DB vide)
-
-Minimum = 0 (ne pas aller en négatif)
-```
-
-## QUALITÉ DES ISSUES - RÈGLES OBLIGATOIRES
-
-### Règle 1 : Snippet de code dans `where`
-
-Le champ `where` DOIT contenir un snippet de code de 5-15 lignes montrant exactement la vulnérabilité.
-
-**Format obligatoire** :
-```markdown
-## Localisation de la vulnérabilité
-
-Le problème se trouve dans `{fichier}` à la ligne {ligne}.
-
-```{langage}
-// Code vulnérable avec contexte
-void vulnerableFunction(const char* user_input) {
-    char buffer[256];
-    strcpy(buffer, user_input);  // ⚠️ DANGER: No bounds check
-    // ...
-}
-```
-
-Cette fonction est vulnérable car {explication détaillée de la faille}. Elle est exposée via {point d'entrée}.
-```
-
-### Règle 2 : Diagramme Mermaid dans `why`
-
-Le champ `why` DOIT contenir au moins un diagramme Mermaid pour visualiser le scénario d'attaque ou la chaîne d'impact.
-
-**Types de diagrammes recommandés** :
-- `sequenceDiagram` : Pour montrer le scénario d'attaque étape par étape
-- `graph TD` : Pour montrer la propagation de la vulnérabilité
-- `graph LR` : Pour montrer la chaîne d'exploitation
-
-**Format obligatoire** :
-```markdown
-## Pourquoi c'est un problème
-
-{Explication du risque de sécurité}
-
-### Scénario d'attaque
-
-```mermaid
-sequenceDiagram
-    participant Attaquant
-    participant Application
-    participant Système
-
-    Attaquant->>Application: Données malveillantes
-    Application->>Système: Exécution non sécurisée
-    Système-->>Attaquant: Accès non autorisé
-```
-
-### Impact
-
-| Risque | Probabilité | Impact |
-|--------|-------------|--------|
-| {risque 1} | Haute/Moyenne/Basse | Critique/Majeur/Mineur |
-```
-
-### Règle 3 : isBug = crash uniquement
-
-**DÉFINITION STRICTE** :
-- `isBug: true` : Le code CRASHE l'application (buffer overflow exploitable → segfault, use-after-free → crash)
-- `isBug: false` : Vulnérabilités sans crash (SQL injection, XSS, credentials hardcodées, command injection)
-
-**Exemples** :
-| Vulnérabilité | isBug | Justification |
-|---------------|-------|---------------|
-| Buffer overflow avec strcpy | `true` | Segfault si input > buffer |
-| Use-after-free | `true` | Crash à l'accès mémoire |
-| SQL Injection | `false` | Données exposées mais app fonctionne |
-| Hardcoded password | `false` | Vulnérabilité mais pas de crash |
-| Command injection | `false` | Exécution arbitraire mais pas de crash immédiat |
-
-### Règle 4 : Issues utiles uniquement
-
-**NE PAS générer d'issues pour** :
-- `std::cout` ou logs de debug retirés
-- Changements de formatting
-- Renommage de variables
-- Commentaires modifiés
-
-**GARDER les issues pour** :
-- Toute vulnérabilité de sécurité (CWE référencée)
-- Régressions de bugs passés
-- Patterns dangereux (strcpy, system, eval...)
-- Credentials ou secrets hardcodés
-
-### Règle 5 : Issues indépendantes
-
-Chaque issue DOIT être compréhensible seule.
-
-**INTERDIT** :
-- "Voir aussi l'issue SEC-002"
-- "Cette vulnérabilité est liée à..."
-- "En combinaison avec le problème ci-dessus..."
-
-**OBLIGATOIRE** :
-- Chaque issue contient le scénario d'attaque complet
-- Chaque issue référence son propre CWE
-- Pas de dépendances entre issues
-
-### Règle 6 : Markdown professionnel
-
-Utiliser une structure riche :
-- Titres H2 et H3
-- Tableaux pour les risques et impacts
-- Blocs de code avec langage spécifié
-- Diagrammes Mermaid pour les scénarios d'attaque
-- Liens vers les références CWE
-
-### Règle 7 : Contenu verbeux et explicatif
-
-**Longueur minimale** :
-- `where` : 100-200 mots + snippet de code vulnérable
-- `why` : 150-300 mots + diagramme d'attaque Mermaid
-- `how` : 150-300 mots + code corrigé complet
-
-**Format des findings avec where/why/how** :
-
-```json
-{
-  "id": "SEC-001",
-  "source": ["security"],
-  "severity": "Blocker",
-  "category": "Security",
-  "isBug": true,
-  "type": "regression",
-  "cwe": "CWE-120",
-  "file": "src/server/UDPServer.cpp",
-  "line": 67,
-  "function": "processRequest",
-  "related_bug": "BUG-456",
-  "message": "RÉGRESSION - Buffer Overflow similaire au bug #BUG-456",
-  "blocking": true,
-  "time_estimate_min": 5,
-  "where": "## Localisation de la vulnérabilité\n\nLa vulnérabilité se trouve dans `src/server/UDPServer.cpp` à la ligne 67, dans la fonction `processRequest`.\n\n```cpp\nvoid processRequest(const char* user_data) {\n    char response_buffer[256];\n    strcpy(response_buffer, user_data);  // ⚠️ DANGER: No bounds check\n    // Le reste du traitement...\n    send(socket, response_buffer, strlen(response_buffer), 0);\n}\n```\n\nCette fonction reçoit des données directement du réseau via `user_data`. Elle copie ces données dans un buffer de taille fixe (256 octets) sans vérifier la longueur. Si les données dépassent 255 caractères, l'écriture déborde dans la pile.\n\n> **⚠️ RÉGRESSION** : Ce code est similaire au bug #BUG-456 corrigé le 2025-10-15. Le même pattern dangereux a été réintroduit.",
-  "why": "## Pourquoi c'est un problème\n\nCe buffer overflow est **critique** car il est exposé au réseau et peut être exploité à distance.\n\n### Scénario d'attaque\n\n```mermaid\nsequenceDiagram\n    participant Attaquant\n    participant Serveur UDP\n    participant Mémoire\n\n    Attaquant->>Serveur UDP: Paquet avec 1000 octets\n    Serveur UDP->>Mémoire: strcpy copie tout\n    Note over Mémoire: Débordement de pile\n    Mémoire-->>Serveur UDP: Crash (SIGSEGV)\n    Note over Serveur UDP: Serveur down\n```\n\n### Impact\n\n| Risque | Probabilité | Impact |\n|--------|-------------|--------|\n| Crash du serveur | Haute | Critique |\n| Exécution de code arbitraire | Moyenne | Critique |\n| Déni de service permanent | Haute | Majeur |\n\n### Référence\n\n- **CWE-120** : Buffer Copy without Checking Size of Input\n- **Bug similaire** : #BUG-456 (corrigé 2025-10-15, régression détectée)",
-  "how": "## Comment corriger\n\n### Solution recommandée\n\nUtiliser `strncpy` avec une limite explicite et garantir la terminaison null.\n\n```cpp\nvoid processRequest(const char* user_data) {\n    char response_buffer[256];\n    \n    // ✅ Copie sécurisée avec limite\n    strncpy(response_buffer, user_data, sizeof(response_buffer) - 1);\n    response_buffer[sizeof(response_buffer) - 1] = '\\0';\n    \n    send(socket, response_buffer, strlen(response_buffer), 0);\n}\n```\n\n### Processus de correction\n\n```mermaid\ngraph LR\n    A[Identifier strcpy] --> B[Remplacer par strncpy]\n    B --> C[Ajouter null terminator]\n    C --> D[Tester avec fuzzer]\n    D --> E[Code review sécurité]\n```\n\n### Validation\n\n1. Tester avec des inputs de 255, 256, 500 et 1000 caractères\n2. Vérifier avec Valgrind ou ASan qu'il n'y a plus de débordement\n3. Ajouter un test de régression pour ce cas\n\n### Références\n\n- [CWE-120](https://cwe.mitre.org/data/definitions/120.html)\n- Ticket original : #BUG-456"
-}
-```
-
-## Règles
-
-1. **OBLIGATOIRE** : Consulter error_history EN PREMIER
-2. **OBLIGATOIRE** : Comparer le nouveau code aux bugs passés
-3. **OBLIGATOIRE** : Référencer les CWE pour chaque vulnérabilité
-4. **OBLIGATOIRE** : Fournir code actuel + correction pour chaque issue avec where/why/how
-5. **OBLIGATOIRE** : Produire le JSON final pour synthesis avec where/why/how complets
-6. **Toujours** tracer la propagation des vulnérabilités (symbol_callers)
-7. **Toujours** marquer les régressions comme BLOQUANTES
-8. **Toujours** inclure un diagramme Mermaid dans `why`
-9. **Jamais** de faux positifs - en cas de doute, mentionner l'incertitude
