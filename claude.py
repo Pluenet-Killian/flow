@@ -429,7 +429,7 @@ async def launch_claude_stream_json(
     request,
     max_timeout: int = 7200,
     verbosity: int = 1,
-    ws_url: str = "ws://192.36.128.57:8080/api/ws/jobs"
+    ws_url: str = "ws://192.36.128.72:8080/api/ws/jobs"
 ) -> dict:
     """
     Lance Claude en mode stream-json avec architecture async native.
@@ -463,63 +463,73 @@ async def launch_claude_stream_json(
             notifier = WebSocketNotifier(websocket)
             processor = ClaudeEventProcessor(notifier, verbosity)
 
-            # Démarrer l'action
-            await notifier.action_started()
-            await notifier.step_started("setup")
-            await notifier.step_log("Initializing Claude stream-json...")
-            await notifier.step_complete("success", "Setup completed")
-            # Les phases (phase1, phase2_risk, etc.) démarrent automatiquement
-            # quand les agents Task sont détectés dans _handle_tool_use
-
-            # Lancer le processus Claude
-            # limit=1MB pour éviter "Separator is found, but chunk is longer than limit"
-            # quand Claude génère des lignes JSON très longues (rapports avec markdown)
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=dict(os.environ),  # Hérite du PATH complet (fnm, nvm, etc.)
-                limit=2**20  # 1MB au lieu de 64KB par défaut
-            )
-
             try:
-                # Lire stdout et stderr en parallèle avec timeout
-                async with asyncio.timeout(max_timeout):
-                    await asyncio.gather(
-                        read_stream(process.stdout, processor),
-                        read_stderr(process.stderr)
-                    )
+                # Démarrer l'action
+                await notifier.action_started()
+                await notifier.step_started("setup")
+                await notifier.step_log("Initializing Claude stream-json...")
+
+                # Lancer le processus Claude
+                # limit=1MB pour éviter "Separator is found, but chunk is longer than limit"
+                # quand Claude génère des lignes JSON très longues (rapports avec markdown)
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=dict(os.environ),  # Hérite du PATH complet (fnm, nvm, etc.)
+                    limit=2**20  # 1MB au lieu de 64KB par défaut
+                )
+                # Les phases (phase1, phase2_risk, etc.) démarrent automatiquement
+                # quand les agents Task sont détectés dans _handle_tool_use
+                # Le step_complete de setup est appelé par transition_to() lors du premier agent
+
+                try:
+                    # Lire stdout et stderr en parallèle avec timeout
+                    async with asyncio.timeout(max_timeout):
+                        await asyncio.gather(
+                            read_stream(process.stdout, processor),
+                            read_stderr(process.stderr)
+                        )
+                        await process.wait()
+
+                except asyncio.TimeoutError:
+                    log_to_stderr(f"\n⏱️ Timeout atteint ({max_timeout}s)\n")
+                    await notifier.step_log(f"Timeout after {max_timeout}s", "stderr")
+                    await notifier.step_complete("failure", f"Timeout after {max_timeout}s")
+                    await notifier.action_complete()
+                    process.kill()
                     await process.wait()
 
-            except asyncio.TimeoutError:
-                log_to_stderr(f"\n⏱️ Timeout atteint ({max_timeout}s)\n")
-                await notifier.step_log(f"Timeout after {max_timeout}s", "stderr")
-                await notifier.step_complete("failure", f"Timeout after {max_timeout}s")
-                await notifier.action_complete()
-                process.kill()
-                await process.wait()
+                    return {
+                        "success": False,
+                        "result": processor.result_text,
+                        "cost": processor.total_cost,
+                        "messages": processor.messages,
+                        "error": f"Timeout after {max_timeout}s"
+                    }
+
+                # Finaliser si pas encore fait
+                if not notifier.action_completed:
+                    if notifier.current_step:
+                        await notifier.step_complete(notifier.action_status, "Process completed")
+                    await notifier.action_complete()
 
                 return {
-                    "success": False,
+                    "success": process.returncode == 0,
                     "result": processor.result_text,
                     "cost": processor.total_cost,
                     "messages": processor.messages,
-                    "error": f"Timeout after {max_timeout}s"
+                    "returncode": process.returncode
                 }
 
-            # Finaliser si pas encore fait
-            if not notifier.action_completed:
-                if notifier.current_step:
-                    await notifier.step_complete(notifier.action_status, "Process completed")
+            except Exception as e:
+                # Erreur pendant l'exécution avec WebSocket connecté
+                error_msg = f"{type(e).__name__}: {e}"
+                log_to_stderr(f"\n❌ Execution error: {error_msg}\n")
+                await notifier.step_log(f"Error: {error_msg}", "stderr")
+                await notifier.step_complete("failure", f"Error: {error_msg}")
                 await notifier.action_complete()
-
-            return {
-                "success": process.returncode == 0,
-                "result": processor.result_text,
-                "cost": processor.total_cost,
-                "messages": processor.messages,
-                "returncode": process.returncode
-            }
+                raise  # Re-raise pour être capturé par le handler externe
 
     except websockets.exceptions.WebSocketException as e:
         log_to_stderr(f"\n❌ WebSocket error: {e}\n")
@@ -531,8 +541,39 @@ async def launch_claude_stream_json(
             "error": f"WebSocket error: {e}"
         }
 
+    except FileNotFoundError as e:
+        # Claude CLI non trouvé
+        error_msg = f"Claude CLI not found: {e}"
+        log_to_stderr(f"\n❌ {error_msg}\n")
+        try:
+            async with websockets.connect(ws_url + f"/{request.jobId}") as ws:
+                await ws.send(json.dumps({
+                    "type": "action_error",
+                    "error": error_msg,
+                    "status": "failure"
+                }))
+        except Exception:
+            pass  # Best effort
+        return {
+            "success": False,
+            "result": "",
+            "cost": 0.0,
+            "messages": [],
+            "error": error_msg
+        }
+
     except Exception as e:
-        log_to_stderr(f"\n❌ Error: {type(e).__name__}: {e}\n")
+        error_msg = f"{type(e).__name__}: {e}"
+        log_to_stderr(f"\n❌ Error: {error_msg}\n")
+        try:
+            async with websockets.connect(ws_url + f"/{request.jobId}") as ws:
+                await ws.send(json.dumps({
+                    "type": "action_error",
+                    "error": error_msg,
+                    "status": "failure"
+                }))
+        except Exception:
+            pass  # Best effort
         return {
             "success": False,
             "result": "",
