@@ -4,16 +4,18 @@ Tu dois orchestrer une analyse du code en utilisant les 5 agents spécialisés e
 
 ---
 
-## CONTEXTE GIT (pré-calculé par main.py)
+## CONTEXTE GIT - Scope de l'analyse (calculé via git merge-base)
 
 | Paramètre | Valeur |
 |-----------|--------|
 | **Branche** | $BRANCH_NAME |
 | **Branche parente** | $PARENT_BRANCH |
 | **Mode détection** | $DETECTION_MODE |
-| **From commit** | $FROM_COMMIT_SHORT |
-| **To commit** | $TO_COMMIT_SHORT |
+| **From (base)** | $FROM_COMMIT_SHORT ← point de divergence avec $PARENT_BRANCH |
+| **To (HEAD)** | $TO_COMMIT_SHORT ← commit à analyser |
 | **Fichiers** | $FILES_COUNT fichiers à analyser |
+
+> ⚠️ **Ne pas confondre** avec le checkpoint AgentDB (indexation des symboles) qui peut être différent.
 
 ### Fichiers modifiés :
 $FILES_LIST
@@ -67,8 +69,8 @@ Le contexte git est **déjà calculé** par main.py. Tu reçois directement :
 ║                                                               ║
 ║  ✅ Aucun fichier de code à analyser                          ║
 ║                                                               ║
-║  From : $FROM_COMMIT_SHORT                                    ║
-║  To   : $TO_COMMIT_SHORT                                      ║
+║  From (base) : $FROM_COMMIT_SHORT (git merge-base)            ║
+║  To (HEAD)   : $TO_COMMIT_SHORT                               ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 ```
@@ -130,13 +132,13 @@ fi
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
-║  ANALYSE DE CODE                                              ║
+║  [Code Analysis] SCOPE DES MODIFICATIONS                      ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  Branche        : $BRANCH_NAME                                ║
 ║  Branche parent : $PARENT_BRANCH                              ║
 ║  Mode           : $DETECTION_MODE                             ║
-║  From           : $FROM_COMMIT_SHORT                          ║
-║  To             : $TO_COMMIT_SHORT                            ║
+║  From (base)    : $FROM_COMMIT_SHORT (git merge-base)         ║
+║  To (HEAD)      : $TO_COMMIT_SHORT                            ║
 ║  Fichiers       : $FILES_COUNT fichiers à analyser            ║
 ║  SonarQube      : {Disponible/Non disponible}                 ║
 ╠═══════════════════════════════════════════════════════════════╣
@@ -144,6 +146,9 @@ fi
 $FILES_LIST
 ╚═══════════════════════════════════════════════════════════════╝
 ```
+
+> **Note** : Ce scope (From → To) représente les modifications par rapport à la branche parent,
+> calculé via `git merge-base`. C'est différent du checkpoint AgentDB qui track l'indexation des symboles.
 
 ---
 

@@ -1,0 +1,50 @@
+# =============================================================================
+# Configuration SonarCloud pour CRE Flow
+# =============================================================================
+# Les valeurs ${VAR} sont remplacées par les variables d'environnement
+# Définir dans .env à la racine du projet
+
+sonarcloud:
+  # URL de l'API SonarCloud
+  url: "https://sonarcloud.io/api"
+
+  # Clé du projet (format: organization_repository)
+  # Override via: SONAR_PROJECT_KEY
+  project_key: "${SONAR_PROJECT_KEY}"
+
+  # Token d'authentification (ne PAS mettre ici, utiliser .env)
+  # token: "${SONAR_TOKEN}"
+
+  # Paramètres par défaut pour l'API /issues/search
+  defaults:
+    page_size: 500
+    statuses: "OPEN,CONFIRMED,REOPENED"
+    types: "BUG,CODE_SMELL,VULNERABILITY"
+    # severities: "BLOCKER,CRITICAL,MAJOR"  # Décommenter pour filtrer
+
+  # Options de filtrage automatique
+  auto_filter:
+    # Utiliser la date du merge-base pour filtrer les issues
+    use_merge_base_date: true
+
+    # Utiliser sinceLeakPeriod au lieu de createdAfter
+    # (plus précis si configuré dans SonarCloud)
+    use_leak_period: false
+
+    # Fallback: durée relative si pas de merge-base
+    fallback_since: "7d"
+
+  # Endpoints disponibles
+  endpoints:
+    issues: "/issues/search"
+    hotspots: "/hotspots/search"
+    measures: "/measures/component"
+
+# =============================================================================
+# Mapping des fichiers de sortie
+# =============================================================================
+output:
+  # Dossier de sortie relatif au report_dir
+  issues_file: "sonar-issues.json"
+  report_file: "sonar.md"
+  enriched_file: "sonar-enriched.json"

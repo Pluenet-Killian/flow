@@ -174,24 +174,48 @@ int init() {
 .claude/
 |-- agentdb/                 # Coeur de la bibliotheque
 |   |-- schema.sql          # Schema SQLite (11 tables)
+|   |-- db.sqlite           # Base principale
+|   |-- shared.sqlite       # Base partagee multi-branche
 |   |-- models.py           # Modeles de donnees
 |   |-- db.py               # Gestion de connexion
-|   |-- crud.py             # Operations CRUD
-|   |-- queries.py          # Requetes complexes
+|   |-- crud.py             # Operations CRUD (2300+ lignes)
+|   |-- queries.py          # Requetes graphe recursives
 |   |-- config.py           # Configuration
-|   +-- indexer.py          # Parseur de code
+|   |-- indexer.py          # Parseur de code (1700+ lignes)
+|   +-- query.sh            # Interface shell pour agents
 |
-|-- mcp/agentdb/            # Serveur MCP
-|   |-- server.py           # Point d'entree
-|   +-- tools.py            # 10 outils exposes
+|-- agents/                  # 8 agents specialises
+|   |-- analyzer.md         # Phase 1 - Analyse d'impact
+|   |-- security.md         # Phase 1 - Vulnerabilites
+|   |-- reviewer.md         # Phase 1 - Code review
+|   |-- risk.md             # Phase 1 - Scoring risque
+|   |-- synthesis.md        # Phase 2 - Fusion 4 agents
+|   |-- sonar.md            # Phase 2 - Enrichit SonarQube
+|   |-- meta-synthesis.md   # Phase 3 - Consolidation
+|   +-- web-synthesizer.md  # Phase 4 - JSON pour site
+|
+|-- commands/                # Commandes CLI
+|   +-- analyze.md          # /analyze - Orchestration complete
+|
+|-- mcp/                     # Serveurs MCP
+|   |-- agentdb/            # AgentDB MCP (10 outils)
+|   +-- jira/               # Jira MCP (optionnel)
 |
 |-- scripts/                 # Automatisation
 |   |-- bootstrap.py        # Initialisation (9 etapes)
-|   +-- update.py           # Mise a jour incrementale
+|   |-- update.py           # Mise a jour incrementale
+|   |-- maintenance.py      # VACUUM, ANALYZE, cleanup
+|   +-- transform-sonar.py  # Transformation issues Sonar
 |
-|-- tests/                   # Suite de tests
+|-- reports/                 # Rapports generes
+|   +-- {date}-{commit}/    # Un dossier par analyse
+|
 |-- config/                  # Configuration YAML
-+-- logs/                    # Journaux
+|-- tests/                   # Suite de tests
+|-- logs/                    # Journaux et metriques
+|
+|-- agentdb_manager.py       # Gestionnaire multi-branche
++-- worktree.py              # Gestionnaire git worktrees
 ```
 
 ---

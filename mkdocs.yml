@@ -1,0 +1,91 @@
+site_name: CRE - Code Review Engine
+site_description: Documentation du système d'analyse de code multi-agents avec AgentDB
+site_author: CRE Team
+
+docs_dir: docs_claude
+
+theme:
+  name: material
+  language: fr
+  font:
+    text: Inter
+    code: JetBrains Mono
+
+  palette:
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Mode clair
+      primary: deep purple
+      accent: cyan
+
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Mode sombre
+      primary: deep purple
+      accent: deep orange
+
+  features:
+    - navigation.instant
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+
+  icon:
+    logo: material/robot
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      use_pygments: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - pymdownx.mark
+  - pymdownx.keys
+  - def_list
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Accueil:
+      - Introduction: 01-introduction-et-philosophie.md
+
+  - Architecture:
+      - Vue Globale: 02-architecture-globale.md
+      - Configuration: 03-analyse-configuration.md
+
+  - Outils MCP:
+      - Les 10 Outils: 04-mcp-et-outils.md
+
+  - Guide Pratique:
+      - Tutoriel Complet: 05-guide-lineaire.md
+      - Maintenance & Tests: 06-maintenance-et-tests.md
+
+  - Reference:
+      - AgentDB Complet: AGENTDB.md
+      - Les 8 Agents: AGENTS.md
+
+extra:
+  generator: false

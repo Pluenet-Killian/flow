@@ -1,8 +1,8 @@
-# PROMPT COMPLET : Les 5 Agents d'Analyse de Code
+# PROMPT COMPLET : Les 8 Agents d'Analyse de Code
 
 > **Document de référence pour Claude Code**
-> 
-> Ce document spécifie les 5 agents (subagents) Claude Code pour l'analyse de code.
+>
+> Ce document spécifie les 8 agents (subagents) Claude Code pour l'analyse de code.
 > Format : Markdown avec YAML frontmatter conforme à la documentation officielle.
 
 ---
@@ -15,8 +15,11 @@
 4. [Agent REVIEWER](#4-agent-reviewer)
 5. [Agent RISK](#5-agent-risk)
 6. [Agent SYNTHESIS](#6-agent-synthesis)
-7. [Structure des Fichiers](#7-structure-des-fichiers)
-8. [Instructions d'Implémentation](#8-instructions-dimplémentation)
+7. [Agent SONAR](#7-agent-sonar)
+8. [Agent META-SYNTHESIS](#8-agent-meta-synthesis)
+9. [Agent WEB-SYNTHESIZER](#9-agent-web-synthesizer)
+10. [Structure des Fichiers](#10-structure-des-fichiers)
+11. [Instructions d'Implémentation](#11-instructions-dimplémentation)
 
 ---
 
@@ -24,44 +27,62 @@
 
 ## 1.1 Vue d'Ensemble
 
-5 agents spécialisés qui analysent le code sous différents angles :
+8 agents spécialisés organisés en **4 phases** :
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    CLAUDE (Main Thread)                     │
-│                                                             │
-│   "Analyse les changements du dernier commit"               │
-│                                                             │
-│   Claude délègue automatiquement aux subagents :            │
-│                                                             │
-│   ┌───────────┐ ┌───────────┐ ┌───────────┐                │
-│   │ ANALYZER  │ │ SECURITY  │ │ REVIEWER  │                │
-│   │ (impact)  │ │ (failles) │ │ (qualité) │                │
-│   └─────┬─────┘ └─────┬─────┘ └─────┬─────┘                │
-│         │             │             │                       │
-│         └──────────┬──┴─────────────┘                       │
-│                    ▼                                        │
-│              ┌───────────┐                                  │
-│              │   RISK    │                                  │
-│              │  (score)  │                                  │
-│              └─────┬─────┘                                  │
-│                    ▼                                        │
-│              ┌───────────┐                                  │
-│              │ SYNTHESIS │                                  │
-│              │ (rapport) │                                  │
-│              └───────────┘                                  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         /analyze Command                             │
+│                                                                      │
+│  PHASE 0: Initialisation                                             │
+│  └─ Nettoyer logs + AgentDB bootstrap --incremental                  │
+│                                                                      │
+│  PHASE 1: Analyse Parallèle (3 agents simultanés)                    │
+│  ┌───────────┐ ┌───────────┐ ┌───────────┐                          │
+│  │ ANALYZER  │ │ SECURITY  │ │ REVIEWER  │                          │
+│  │ (impact)  │ │ (failles) │ │ (qualité) │                          │
+│  └─────┬─────┘ └─────┬─────┘ └─────┬─────┘                          │
+│        │             │             │                                 │
+│        └─────────────┴──────┬──────┘                                 │
+│                             ▼                                        │
+│  PHASE 2: RISK puis Enrichissement parallèle                         │
+│              ┌───────────┐                                           │
+│              │   RISK    │  ← Attend les 3 rapports Phase 1          │
+│              │  (score)  │                                           │
+│              └─────┬─────┘                                           │
+│                    ▼                                                 │
+│  ┌───────────────────┐     ┌───────────────────┐                     │
+│  │     SYNTHESIS     │     │      SONAR        │                     │
+│  │ (fusionne 4 agents)│     │ (enrichit Sonar) │                     │
+│  └─────────┬─────────┘     └─────────┬─────────┘                     │
+│            │                         │                               │
+│            └────────────┬────────────┘                               │
+│                         ▼                                            │
+│  PHASE 3: Consolidation                                              │
+│              ┌───────────────────┐                                   │
+│              │   META-SYNTHESIS  │                                   │
+│              │ (fusion + dédup)  │                                   │
+│              └─────────┬─────────┘                                   │
+│                        ▼                                             │
+│  PHASE 4: Publication                                                │
+│              ┌───────────────────┐                                   │
+│              │  WEB-SYNTHESIZER  │                                   │
+│              │ (JSON pour site)  │                                   │
+│              └───────────────────┘                                   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-## 1.2 Les 5 Agents
+## 1.2 Les 8 Agents
 
-| Agent | Rôle | Quand l'utiliser |
-|-------|------|------------------|
-| **analyzer** | Comprendre les changements et calculer l'impact | Quand du code est modifié |
-| **security** | Détecter vulnérabilités et régressions | Pour audit sécurité |
-| **reviewer** | Vérifier qualité et conventions | Pour code review |
-| **risk** | Évaluer le risque global | Après les autres analyses |
-| **synthesis** | Produire le rapport final | Pour synthétiser les résultats |
+| Phase | Agent | Rôle | Exécution |
+|-------|-------|------|-----------|
+| 1 | **analyzer** | Comprendre les changements et calculer l'impact | Parallèle |
+| 1 | **security** | Détecter vulnérabilités et régressions | Parallèle |
+| 1 | **reviewer** | Vérifier qualité et conventions | Parallèle |
+| 2 | **risk** | Évaluer le risque global | Séquentiel (attend Phase 1) |
+| 2 | **synthesis** | Fusionne les 4 agents, détecte contradictions | Parallèle avec sonar |
+| 2 | **sonar** | Enrichit les issues SonarQube avec AgentDB | Parallèle avec synthesis |
+| 3 | **meta-synthesis** | Fusionne synthesis + sonar, dédoublonne | Séquentiel |
+| 4 | **web-synthesizer** | Transforme en JSON pour le site web | Séquentiel |
 
 ## 1.3 Outils MCP AgentDB
 
@@ -672,45 +693,240 @@ Modification ajoutant un timeout UDP. Score global : 72/100.
 
 ---
 
-# 7. Structure des Fichiers
+# 7. Agent SONAR
 
+## 7.1 Fichier : `.claude/agents/sonar.md`
+
+```markdown
+---
+name: sonar
+description: |
+  Enrichit les issues SonarQube avec le contexte du projet via AgentDB.
+  S'exécute en Phase 2 (parallèle avec SYNTHESIS) si un rapport SonarQube est disponible.
+  Produit un rapport structuré pour META-SYNTHESIS.
+tools: Read, Grep, Glob, Bash
+model: opus
+---
+
+# Agent SONAR
+
+Tu es un expert en analyse de qualité de code. Ta mission est d'enrichir les issues SonarQube avec le contexte du projet en utilisant **OBLIGATOIREMENT** les données d'AgentDB.
+
+## Ce que tu fais
+
+1. **Lire le fichier transformé** : `sonar-issues.json` (généré par transform-sonar.py)
+2. **Enrichir chaque issue** : Ajouter le contexte AgentDB (rôle du fichier, patterns, ADRs)
+3. **Générer where/why/how riches** : Avec snippets de code et diagrammes Mermaid
+
+## Accès à AgentDB
+
+```bash
+export AGENTDB_CALLER="sonar"
+bash .claude/agentdb/query.sh file_context "path/file.cpp"
+bash .claude/agentdb/query.sh patterns "path/file.cpp"
+bash .claude/agentdb/query.sh file_metrics "path/file.cpp"
+bash .claude/agentdb/query.sh architecture_decisions "module"
 ```
-.claude/
-└── agents/
-    ├── analyzer.md    # Agent d'analyse d'impact
-    ├── security.md    # Agent de sécurité
-    ├── reviewer.md    # Agent de code review
-    ├── risk.md        # Agent d'évaluation des risques
-    └── synthesis.md   # Agent de synthèse
+
+## Format de sortie
+
+Produit deux fichiers :
+- `sonar-enriched.md` : Rapport Markdown lisible
+- `sonar-enriched.json` : JSON structuré pour META-SYNTHESIS
+
+## Règles de qualité
+
+- `where` : DOIT contenir un snippet de code (5-15 lignes)
+- `why` : DOIT contenir un diagramme Mermaid
+- `how` : DOIT contenir une solution concrète
 ```
 
 ---
 
-# 8. Instructions d'Implémentation
+# 8. Agent META-SYNTHESIS
 
-## 8.1 Ordre de création
+## 8.1 Fichier : `.claude/agents/meta-synthesis.md`
 
+```markdown
+---
+name: meta-synthesis
+description: |
+  Fusionne et dédoublonne les rapports SYNTHESIS et SONAR.
+  S'exécute en Phase 3 après SYNTHESIS et SONAR.
+  Garantit que CHAQUE issue a where/why/how complets.
+tools: Read, Bash
+model: opus
+---
+
+# Agent META-SYNTHESIS
+
+Tu es un expert en fusion et consolidation de rapports. Ta mission est de combiner les résultats de SYNTHESIS et SONAR en un rapport unique.
+
+## RÈGLE ABSOLUE
+
+**CHAQUE issue dans le rapport final DOIT avoir `where`, `why`, `how` NON VIDES.**
+
+## Ce que tu fais
+
+1. **Charger les rapports** : SYNTHESIS (REPORT.json) + SONAR (sonar-enriched.json)
+2. **Détecter les doublons** : Même fichier, ligne ±5, même catégorie
+3. **Fusionner les doublons** : Combiner les sources, garder la sévérité max
+4. **Compléter les données manquantes** : Générer where/why/how si absent
+
+## Règles de fusion des doublons
+
+| Champ | Règle |
+|-------|-------|
+| `id` | Garder l'ID agent (priorité sur SonarQube) |
+| `source` | Combiner : `["security", "sonarqube"]` |
+| `severity` | Garder la plus haute |
+| `where/why/how` | Fusionner les contenus |
+
+## Format de sortie
+
+- `meta-synthesis.json` : JSON consolidé pour WEB-SYNTHESIZER
+- `meta-synthesis-report.md` : Résumé lisible
+```
+
+---
+
+# 9. Agent WEB-SYNTHESIZER
+
+## 9.1 Fichier : `.claude/agents/web-synthesizer.md`
+
+```markdown
+---
+name: web-synthesizer
+description: |
+  Transforme le rapport META-SYNTHESIS en format compatible avec le site web CRE Interface.
+  S'exécute en Phase 4 après META-SYNTHESIS.
+  Génère un fichier JSON avec issues[] et issueDetails{}.
+tools: Read, Bash
+model: opus
+---
+
+# Agent WEB SYNTHESIZER
+
+Tu es un expert en transformation de données. Ta mission est de convertir le rapport META-SYNTHESIS en JSON pour le site web.
+
+## RÈGLE ABSOLUE
+
+**`issues.length === Object.keys(issueDetails).length`**
+
+Chaque issue DOIT avoir une entrée dans issueDetails avec where/why/how NON VIDES.
+
+## Ce que tu fais (SIMPLIFIÉ)
+
+- ✅ **Lecture** du rapport META-SYNTHESIS
+- ✅ **Transformation** en format JSON site web
+- ✅ **Vérification** de la cohérence
+
+## Ce que tu NE fais PLUS
+
+- ❌ **Dédoublonnage** : Déjà fait par META-SYNTHESIS
+- ❌ **Fusion** : Déjà fait par META-SYNTHESIS
+- ❌ **Génération where/why/how** : Déjà fait par META-SYNTHESIS
+
+## Format de sortie
+
+```json
+{
+  "metadata": {
+    "commit": "abc1234",
+    "branch": "feature/xxx",
+    "verdict": "CAREFUL",
+    "score": 62
+  },
+  "issues": [
+    {
+      "id": "SEC-001",
+      "source": ["security"],
+      "title": "Buffer Overflow",
+      "severity": "Blocker",
+      "file": "path/file.cpp",
+      "line": 42
+    }
+  ],
+  "issueDetails": {
+    "SEC-001": {
+      "where": "## Localisation...",
+      "why": "## Pourquoi...",
+      "how": "## Comment..."
+    }
+  }
+}
+```
+```
+
+---
+
+# 10. Structure des Fichiers
+
+```
+.claude/
+└── agents/
+    ├── analyzer.md        # Phase 1 - Agent d'analyse d'impact
+    ├── security.md        # Phase 1 - Agent de sécurité
+    ├── reviewer.md        # Phase 1 - Agent de code review
+    ├── risk.md            # Phase 1 - Agent d'évaluation des risques
+    ├── synthesis.md       # Phase 2 - Fusionne les 4 agents
+    ├── sonar.md           # Phase 2 - Enrichit SonarQube
+    ├── meta-synthesis.md  # Phase 3 - Consolidation finale
+    └── web-synthesizer.md # Phase 4 - JSON pour site web
+```
+
+---
+
+# 11. Instructions d'Implémentation
+
+## 11.1 Ordre de création
+
+**Phase 1 (peuvent être créés en parallèle)** :
 1. `analyzer.md` - Base pour les autres
 2. `security.md` - Utilise l'historique AgentDB
 3. `reviewer.md` - Utilise les patterns AgentDB
 4. `risk.md` - Combine les informations
-5. `synthesis.md` - Fusionne tout
 
-## 8.2 Test de chaque agent
+**Phase 2** :
+5. `synthesis.md` - Fusionne les 4 agents Phase 1
+6. `sonar.md` - Enrichit SonarQube (optionnel)
+
+**Phase 3** :
+7. `meta-synthesis.md` - Consolidation finale
+
+**Phase 4** :
+8. `web-synthesizer.md` - Publication web
+
+## 11.2 Test de chaque agent
 
 Après création, teste avec :
 ```
 "Utilise l'agent analyzer pour analyser les dernières modifications"
 "Utilise l'agent security pour vérifier la sécurité de src/file.cpp"
+"Utilise l'agent sonar pour enrichir les issues SonarQube"
 ```
 
-## 8.3 Points d'attention
+## 11.3 Points d'attention
 
 - **Tools** : Liste les outils MCP AgentDB nécessaires
 - **Description** : Inclure "PROACTIVEMENT" ou "DOIT ÊTRE UTILISÉ" pour auto-délégation
 - **Model** : Utiliser `opus` pour la meilleure qualité d'analyse
 - **Format de sortie** : Définir clairement dans le prompt
+- **Règles de qualité** : where/why/how avec snippets et diagrammes Mermaid
+
+## 11.4 Variables de contexte Git
+
+Le script `main.py` fournit ces variables aux agents :
+
+| Variable | Description |
+|----------|-------------|
+| `$BRANCH_NAME` | Branche actuelle |
+| `$PARENT_BRANCH` | Branche parente (défaut: main) |
+| `$FROM_COMMIT` | Base du diff (git merge-base) |
+| `$TO_COMMIT` | HEAD |
+| `$FILES_LIST` | Liste des fichiers modifiés |
+| `$FILES_COUNT` | Nombre de fichiers |
 
 ---
 
-**Fin du document. Crée les 5 fichiers dans `.claude/agents/`.**
+**Fin du document. Les 8 fichiers sont dans `.claude/agents/`.**

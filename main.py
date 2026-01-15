@@ -4,17 +4,35 @@ API FastAPI pour déclencher les analyses Claude.
 """
 
 import asyncio
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Literal, Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
-from claude import switch_branch, launch_claude_stream_json, log_to_stderr
+import json
+import websockets
+import yaml
+
+from claude import launch_claude_stream_json, log_to_stderr, WebSocketNotifier, WS_BASE_URL
+
+# Charger .env si présent (avant les autres imports qui utilisent les env vars)
+from dotenv import load_dotenv
+load_dotenv()
+
+# Mode test activé via TEST_MODE=1
+TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
+
+# Import du gestionnaire de worktrees
+import sys
+sys.path.insert(0, str(Path(__file__).parent / ".claude"))
+from worktree import WorktreeManager, async_cleanup_expired
 
 
 # =============================================================================
@@ -23,6 +41,281 @@ from claude import switch_branch, launch_claude_stream_json, log_to_stderr
 
 # Extensions de code à analyser
 CODE_EXTENSIONS = ['.c', '.cpp', '.h', '.hpp', '.py', '.js', '.ts', '.tsx', '.go', '.rs', '.java']
+
+
+# =============================================================================
+# SonarCloud Integration
+# =============================================================================
+
+SONAR_CONFIG_PATH = Path(__file__).parent / ".claude" / "config" / "sonar.yaml"
+SONARCLOUD_API_URL = "https://sonarcloud.io/api"
+
+
+def load_sonar_config() -> dict:
+    """Charge la configuration SonarCloud depuis sonar.yaml."""
+    if SONAR_CONFIG_PATH.exists():
+        with open(SONAR_CONFIG_PATH) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def get_sonar_project_key() -> str | None:
+    """Récupère la clé projet SonarCloud depuis env ou config."""
+    # Priorité: variable d'environnement
+    env_key = os.environ.get("SONAR_PROJECT_KEY")
+    if env_key:
+        return env_key
+
+    # Fallback: config yaml (si pas de placeholder)
+    config = load_sonar_config()
+    config_key = config.get("sonarcloud", {}).get("project_key", "")
+    if config_key and not config_key.startswith("$"):
+        return config_key
+
+    return None
+
+
+def get_sonar_token() -> str | None:
+    """Récupère le token SonarCloud depuis l'environnement."""
+    return os.environ.get("SONAR_TOKEN")
+
+
+def format_date_for_sonar(dt: datetime) -> str:
+    """Formate une date pour l'API SonarCloud (ISO 8601)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S+0000")
+
+
+def get_commit_date(commit_sha: str, cwd: Path = None) -> datetime | None:
+    """Récupère la date d'un commit."""
+    success, date_str = run_git_command(
+        ['show', '-s', '--format=%cI', commit_sha],
+        cwd=cwd
+    )
+    if success and date_str:
+        try:
+            return datetime.fromisoformat(date_str)
+        except ValueError:
+            pass
+    return None
+
+
+async def fetch_sonar_issues(
+    git_context: 'GitContext',
+    output_path: Path,
+    branch_name: str,
+) -> dict | None:
+    """
+    Fetch les issues SonarCloud pour le contexte git donné.
+
+    Utilise automatiquement:
+    - La branche du contexte
+    - La date du from_commit (merge-base) comme createdAfter
+
+    Args:
+        git_context: Contexte git résolu
+        output_path: Chemin du fichier JSON de sortie
+        branch_name: Nom de la branche
+
+    Returns:
+        Dict avec les issues ou None si erreur/pas configuré
+    """
+    project_key = get_sonar_project_key()
+    token = get_sonar_token()
+
+    if not project_key:
+        log_to_stderr("[SonarCloud] SONAR_PROJECT_KEY non configuré, skip\n")
+        return None
+
+    if not token:
+        log_to_stderr("[SonarCloud] SONAR_TOKEN non configuré, skip\n")
+        return None
+
+    # Charger la config
+    config = load_sonar_config()
+    defaults = config.get("sonarcloud", {}).get("defaults", {})
+    auto_filter = config.get("sonarcloud", {}).get("auto_filter", {})
+
+    # Construire les paramètres
+    params = {
+        "projectKeys": project_key,
+        "ps": defaults.get("page_size", 500),
+        "p": 1,
+        "branch": branch_name,
+        "statuses": defaults.get("statuses", "OPEN,CONFIRMED,REOPENED"),
+    }
+
+    # Types
+    types = defaults.get("types")
+    if types:
+        params["types"] = types
+
+    # Filtrage par date basé sur le merge-base
+    if auto_filter.get("use_leak_period", False):
+        params["sinceLeakPeriod"] = "true"
+    elif auto_filter.get("use_merge_base_date", True):
+        # Utiliser la date du from_commit (merge-base)
+        merge_base_date = get_commit_date(git_context.from_commit)
+        if merge_base_date:
+            params["createdAfter"] = format_date_for_sonar(merge_base_date)
+            log_to_stderr(f"[SonarCloud] Filtrage depuis merge-base: {params['createdAfter']}\n")
+        else:
+            # Fallback
+            fallback = auto_filter.get("fallback_since", "7d")
+            if fallback.endswith("d"):
+                days = int(fallback[:-1])
+                since = datetime.now(timezone.utc) - timedelta(days=days)
+                params["createdAfter"] = format_date_for_sonar(since)
+
+    # Construire l'URL
+    url = f"{SONARCLOUD_API_URL}/issues/search?{urlencode(params)}"
+
+    log_to_stderr(f"[SonarCloud] Fetching issues...\n")
+    log_to_stderr(f"[SonarCloud] Project: {project_key}\n")
+    log_to_stderr(f"[SonarCloud] Branch: {branch_name}\n")
+
+    # Exécuter curl (en async via subprocess)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-u", f"{token}:", url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+
+        if proc.returncode != 0:
+            log_to_stderr(f"[SonarCloud] Erreur curl: {stderr.decode()}\n")
+            return None
+
+        data = json.loads(stdout.decode())
+
+        # Pagination: si plus de 500 issues, fetch les autres pages
+        total = data.get("total", 0)
+        if total > 500:
+            log_to_stderr(f"[SonarCloud] {total} issues, pagination...\n")
+            all_issues = data.get("issues", [])
+            all_rules = {r.get("key"): r for r in data.get("rules", [])}
+            all_components = {c.get("key"): c for c in data.get("components", [])}
+
+            page = 2
+            while len(all_issues) < total:
+                params["p"] = page
+                page_url = f"{SONARCLOUD_API_URL}/issues/search?{urlencode(params)}"
+
+                proc = await asyncio.create_subprocess_exec(
+                    "curl", "-s", "-u", f"{token}:", page_url,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+                page_data = json.loads(stdout.decode())
+
+                issues = page_data.get("issues", [])
+                if not issues:
+                    break
+
+                all_issues.extend(issues)
+                for r in page_data.get("rules", []):
+                    all_rules[r.get("key")] = r
+                for c in page_data.get("components", []):
+                    all_components[c.get("key")] = c
+
+                page += 1
+
+            data = {
+                "total": len(all_issues),
+                "issues": all_issues,
+                "rules": list(all_rules.values()),
+                "components": list(all_components.values()),
+            }
+
+        # Sauvegarder le résultat
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        issues_count = len(data.get("issues", []))
+        log_to_stderr(f"[SonarCloud] {issues_count} issues récupérées -> {output_path}\n")
+
+        return data
+
+    except asyncio.TimeoutError:
+        log_to_stderr("[SonarCloud] Timeout lors du fetch\n")
+        return None
+    except json.JSONDecodeError as e:
+        log_to_stderr(f"[SonarCloud] JSON invalide: {e}\n")
+        return None
+    except Exception as e:
+        log_to_stderr(f"[SonarCloud] Erreur: {e}\n")
+        return None
+
+
+async def transform_sonar_report(
+    issues_json_path: Path,
+    output_dir: Path,
+    commit: str,
+    branch: str,
+    files_filter: list[str] | None = None,
+) -> Path | None:
+    """
+    Transforme le JSON SonarCloud en rapport Markdown.
+
+    Args:
+        issues_json_path: Chemin du fichier JSON des issues
+        output_dir: Dossier de sortie
+        commit: Hash du commit
+        branch: Nom de la branche
+        files_filter: Liste de fichiers pour filtrer (mode diff)
+
+    Returns:
+        Chemin du rapport MD ou None si erreur
+    """
+    transform_script = Path(__file__).parent / ".claude" / "scripts" / "transform-sonar.py"
+
+    if not transform_script.exists():
+        log_to_stderr(f"[SonarCloud] Script transform-sonar.py introuvable\n")
+        return None
+
+    if not issues_json_path.exists():
+        log_to_stderr(f"[SonarCloud] Fichier issues introuvable: {issues_json_path}\n")
+        return None
+
+    output_md = output_dir / "sonar.md"
+
+    cmd = [
+        "python", str(transform_script),
+        str(issues_json_path),
+        "-o", str(output_md),
+        "-c", commit,
+        "-b", branch,
+    ]
+
+    # Ajouter le filtre de fichiers si présent
+    if files_filter:
+        cmd.extend(["-f", ",".join(files_filter)])
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+
+        if stderr:
+            log_to_stderr(f"[SonarCloud] Transform output:\n{stderr.decode()}\n")
+
+        if output_md.exists():
+            log_to_stderr(f"[SonarCloud] Rapport généré: {output_md}\n")
+            return output_md
+        else:
+            log_to_stderr(f"[SonarCloud] Rapport non généré\n")
+            return None
+
+    except Exception as e:
+        log_to_stderr(f"[SonarCloud] Erreur transform: {e}\n")
+        return None
 
 
 @dataclass
@@ -38,13 +331,14 @@ class GitContext:
     detection_mode: str = "auto"  # "auto" ou "manual"
 
 
-def run_git_command(args: list[str], timeout: int = 60) -> tuple[bool, str]:
+def run_git_command(args: list[str], timeout: int = 60, cwd: Path = None) -> tuple[bool, str]:
     """
     Exécute une commande git et retourne (success, output).
 
     Args:
         args: Liste des arguments git (sans 'git')
         timeout: Timeout en secondes
+        cwd: Répertoire de travail (optionnel, pour les worktrees)
 
     Returns:
         Tuple (success: bool, output: str)
@@ -55,6 +349,7 @@ def run_git_command(args: list[str], timeout: int = 60) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=cwd,
         )
         return result.returncode == 0, result.stdout.strip()
     except subprocess.TimeoutExpired:
@@ -199,19 +494,19 @@ def get_diff_between_commits(from_commit: str, to_commit: str) -> dict:
     }
 
 
-def resolve_git_context(git_param: str, commit_sha: str, branch_name: str) -> GitContext:
+def resolve_git_context(git_param: Optional[str], commit_sha: str, branch_name: str) -> GitContext:
     """
     Résout le contexte git selon le paramètre 'git'.
 
     Args:
-        git_param: "0" pour auto-détection, ou hash de commit
+        git_param: None ou "0" pour auto-détection, ou hash de commit
         commit_sha: Le commit cible (to_commit)
         branch_name: La branche actuelle
 
     Returns:
         GitContext avec toutes les informations nécessaires
     """
-    if git_param == "0":
+    if git_param is None or git_param == "0":
         # Mode 1: Auto-détection de la branche parente
         parent_branch, from_commit = detect_parent_branch(commit_sha, branch_name)
         detection_mode = "auto"
@@ -252,7 +547,7 @@ def build_analysis_prompt(git_context: GitContext, request) -> str:
     Returns:
         Prompt complet pour Claude
     """
-    prompt_path = Path(".claude/commands/analyze_py.md")
+    prompt_path = Path(".claude/commands/analyse_py2.md")
     if not prompt_path.exists():
         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
 
@@ -299,7 +594,7 @@ class ClaudeRequest(BaseModel):
     branchName: str
     commitSha: str
     action: Literal['build_i4gen', 'build_compact', 'issue_detector']
-    git: str  # "0" pour auto-détection branche parente, ou hash de commit
+    lastAnalyzedCommit: Optional[str] = None  # null pour auto-détection branche parente, ou hash de commit
 
 
 class JobInfo(BaseModel):
@@ -324,12 +619,212 @@ running_tasks: set[asyncio.Task] = set()  # Garde les références pour éviter 
 # Application FastAPI
 # =============================================================================
 
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle hooks pour l'application."""
+    # Startup
+    if TEST_MODE:
+        log_to_stderr("=" * 60 + "\n")
+        log_to_stderr("🧪 TEST MODE ENABLED - Claude will NOT be called\n")
+        log_to_stderr("   Will send 1+1=2 and test JSON report instead\n")
+        log_to_stderr("=" * 60 + "\n")
+    log_to_stderr("🧹 Cleaning expired worktrees on startup...\n")
+    cleaned = await async_cleanup_expired()
+    log_to_stderr(f"✅ Startup complete ({cleaned} worktrees cleaned)\n")
+    yield
+    # Shutdown: rien de spécial pour l'instant
+    log_to_stderr("👋 Shutting down...\n")
+
+
 app = FastAPI(
     title="Claude Analysis API",
     description="API pour déclencher des analyses de code avec Claude",
     version="1.0.0",
-    
+    lifespan=lifespan,
 )
+
+
+# =============================================================================
+# WebSocket Error Notification
+# =============================================================================
+
+
+async def run_test_analysis(request: ClaudeRequest) -> None:
+    """
+    Mode test: envoie 1+1=2 puis un fichier JSON de test via WebSocket.
+    Utilisé pour tester le protocole WebSocket sans lancer Claude.
+    """
+    job_id = request.jobId
+    ws_url = f"{WS_BASE_URL}/api/ws/jobs/{job_id}"
+
+    log_to_stderr(f"[TEST MODE] Starting test analysis for job {job_id}\n")
+
+    # Marquer comme en cours
+    if job_id in jobs:
+        jobs[job_id].status = JobStatus.RUNNING
+
+    try:
+        # Connexion WebSocket
+        async with asyncio.timeout(30):
+            websocket = await websockets.connect(ws_url)
+
+        # Attendre le message "connected"
+        async with asyncio.timeout(10):
+            connected_msg = await websocket.recv()
+            connected_data = json.loads(connected_msg)
+            if connected_data.get("type") == "connected":
+                log_to_stderr(f"[TEST MODE] WebSocket connected\n")
+
+        async with websocket:
+            notifier = WebSocketNotifier(websocket)
+
+            # Démarrer l'action
+            await notifier.action_started()
+            await notifier.step_started("setup")
+
+            # Test 1: 1+1=2
+            await notifier.step_log("Calculating 1+1...")
+            await asyncio.sleep(0.5)  # Petit délai pour voir les logs
+            result = 1 + 1
+            await notifier.step_log(f"1 + 1 = {result}")
+            log_to_stderr(f"[TEST MODE] 1 + 1 = {result}\n")
+            
+            await notifier.step_complete("success", f"## Setup\n\n1 + 1 = {result}")
+
+            # Test 2: Créer et envoyer un fichier JSON de test
+            await notifier.step_started("report")
+            await notifier.step_log("Creating test JSON report...")
+
+            # Créer le fichier JSON de test
+            test_report = {
+                "test": True,
+                "result": "1+1=2",
+                "timestamp": datetime.now().isoformat(),
+                "job_id": job_id,
+                "issues": [
+                    {
+                        "id": "TEST-001",
+                        "severity": "info",
+                        "message": "This is a test issue",
+                        "file": "test.py",
+                        "line": 42
+                    },
+                    {
+                        "id": "TEST-002",
+                        "severity": "warning",
+                        "message": "Another test issue with more details",
+                        "file": "another.py",
+                        "line": 100
+                    }
+                ],
+                "summary": {
+                    "total_issues": 2,
+                    "by_severity": {"info": 1, "warning": 1}
+                }
+            }
+
+            # Créer le dossier reports si nécessaire
+            reports_dir = Path("reports")
+            reports_dir.mkdir(exist_ok=True)
+
+            # Écrire le fichier
+            report_path = reports_dir / f"test-report-{job_id}.json"
+            with open(report_path, "w") as f:
+                json.dump(test_report, f, indent=2, ensure_ascii=False)
+
+            log_to_stderr(f"[TEST MODE] Created test report: {report_path}\n")
+            await notifier.step_log(f"Created: {report_path}")
+
+            # Envoyer l'artifact
+            await notifier.step_log(f"Sending artifact: {report_path}")
+            artifact_sent = await notifier.send_artifact(str(report_path), "report")
+
+            if artifact_sent:
+                await notifier.step_log("Artifact sent successfully!")
+                await notifier.step_complete("success", f"## Report\n\nArtifact sent: {report_path}")
+            else:
+                await notifier.step_log("Failed to send artifact", "stderr")
+                await notifier.step_complete("failure", f"## Report\n\nFailed to send artifact")
+
+            await notifier.action_complete()
+
+            # Marquer le job comme terminé
+            if job_id in jobs:
+                jobs[job_id].status = JobStatus.COMPLETED
+                jobs[job_id].completed_at = datetime.now()
+                jobs[job_id].result = {"test": True, "success": artifact_sent}
+
+            log_to_stderr(f"[TEST MODE] Test completed for job {job_id}\n")
+
+    except Exception as e:
+        error_msg = str(e)
+        log_to_stderr(f"[TEST MODE] Error: {error_msg}\n")
+
+        if job_id in jobs:
+            jobs[job_id].status = JobStatus.FAILED
+            jobs[job_id].error = error_msg
+            jobs[job_id].completed_at = datetime.now()
+
+
+async def send_error_to_websocket(job_id: str, error_msg: str) -> None:
+    """
+    Envoie une erreur via WebSocket au client.
+    Utilisé quand une erreur survient avant que launch_claude_stream_json soit appelé.
+    """
+    ws_url = f"{WS_BASE_URL}/api/ws/jobs"
+    try:
+        async with asyncio.timeout(30):
+            ws = await websockets.connect(f"{ws_url}/{job_id}")
+
+        # Attendre le message "connected"
+        async with asyncio.timeout(10):
+            connected_msg = await ws.recv()
+            connected_data = json.loads(connected_msg)
+            if connected_data.get("type") == "connected":
+                log_to_stderr(f"[WS Error] Connected for error notification\n")
+
+        async with ws:
+            notifier = WebSocketNotifier(ws)
+            await notifier.action_started()
+            await notifier.fail_with_error(error_msg)
+            log_to_stderr(f"[WS Error] Error sent to client: {error_msg}\n")
+
+    except Exception as e:
+        log_to_stderr(f"[WS Error] Failed to send error via WebSocket: {e}\n")
+
+
+async def send_no_files_to_websocket(job_id: str, git_context: GitContext) -> None:
+    """
+    Notifie le WebSocket qu'il n'y a pas de fichiers à analyser.
+    Envoie un action_complete avec succès mais sans rapport.
+    """
+    ws_url = f"{WS_BASE_URL}/api/ws/jobs"
+    try:
+        async with asyncio.timeout(30):
+            ws = await websockets.connect(f"{ws_url}/{job_id}")
+
+        # Attendre le message "connected"
+        async with asyncio.timeout(10):
+            connected_msg = await ws.recv()
+            connected_data = json.loads(connected_msg)
+            if connected_data.get("type") == "connected":
+                log_to_stderr(f"[WS NoFiles] Connected for notification\n")
+
+        async with ws:
+            notifier = WebSocketNotifier(ws)
+            await notifier.action_started()
+            await notifier.step_started("setup")
+            await notifier.step_log(f"Git context: {git_context.from_commit_short}..{git_context.to_commit_short}")
+            await notifier.step_log(f"Parent branch: {git_context.parent_branch}")
+            await notifier.step_log("No code files to analyze in this commit range")
+            await notifier.step_complete("success", f"## Setup\n\nNo code files to analyze\n\n- From: {git_context.from_commit_short}\n- To: {git_context.to_commit_short}")
+            await notifier.action_complete()
+            log_to_stderr(f"[WS NoFiles] Notification sent to client\n")
+
+    except Exception as e:
+        log_to_stderr(f"[WS NoFiles] Failed to send notification via WebSocket: {e}\n")
 
 
 # =============================================================================
@@ -340,8 +835,15 @@ async def run_claude_analysis(request: ClaudeRequest) -> None:
     """
     Exécute l'analyse Claude en arrière-plan (async).
     Met à jour le statut du job au fur et à mesure.
+
+    Workflow:
+    1. Créer un worktree isolé pour le commit
+    2. Résoudre le contexte git (diff, fichiers modifiés)
+    3. Lancer Claude dans le worktree
     """
     job_id = request.jobId
+    worktree_mgr = WorktreeManager()
+    working_dir = None
 
     # Marquer comme en cours
     if job_id in jobs:
@@ -350,10 +852,19 @@ async def run_claude_analysis(request: ClaudeRequest) -> None:
     try:
         log_to_stderr(f"[Job {job_id}] Starting Claude analysis...\n")
 
-        # Résoudre le contexte git
+        # === ÉTAPE 1: Créer le worktree isolé ===
+        try:
+            working_dir = worktree_mgr.create_worktree(request.commitSha, request.branchName)
+            log_to_stderr(f"[Job {job_id}] Worktree ready: {working_dir}\n")
+        except RuntimeError as e:
+            raise RuntimeError(f"Worktree creation failed: {e}")
+
+        # === ÉTAPE 2: Résoudre le contexte git ===
+        # Note: on utilise le repo principal pour le contexte git
+        # car le worktree est en détached HEAD
         try:
             git_context = resolve_git_context(
-                git_param=request.git,
+                git_param=request.lastAnalyzedCommit,
                 commit_sha=request.commitSha,
                 branch_name=request.branchName
             )
@@ -367,9 +878,29 @@ async def run_claude_analysis(request: ClaudeRequest) -> None:
         log_to_stderr(f"  To: {git_context.to_commit_short}\n")
         log_to_stderr(f"  Files: {len(git_context.files_changed)} files\n")
 
+        # === ÉTAPE 2.5: Fetch SonarCloud issues (si configuré) ===
+        # Sauvegarder dans .claude/sonar/issues.json (emplacement attendu par /analyze)
+        sonar_dir = Path(".claude/sonar")
+        sonar_dir.mkdir(parents=True, exist_ok=True)
+        sonar_issues_path = sonar_dir / "issues.json"
+
+        sonar_data = await fetch_sonar_issues(
+            git_context=git_context,
+            output_path=sonar_issues_path,
+            branch_name=request.branchName,
+        )
+
+        if sonar_data:
+            log_to_stderr(f"[Job {job_id}] SonarCloud issues saved to {sonar_issues_path}\n")
+            log_to_stderr(f"[Job {job_id}] /analyze will transform via transform-sonar.py\n")
+
         # Vérifier s'il y a des fichiers à analyser
         if not git_context.files_changed:
             log_to_stderr(f"[Job {job_id}] No code files to analyze\n")
+
+            # Notifier le WebSocket que l'analyse est terminée (rien à faire)
+            await send_no_files_to_websocket(job_id, git_context)
+
             if job_id in jobs:
                 jobs[job_id].status = JobStatus.COMPLETED
                 jobs[job_id].completed_at = datetime.now()
@@ -380,13 +911,14 @@ async def run_claude_analysis(request: ClaudeRequest) -> None:
                 }
             return
 
-        # Construire le prompt avec le contexte git
+        # === ÉTAPE 3: Construire le prompt et lancer Claude ===
         prompt = build_analysis_prompt(git_context, request)
 
-        # Lancer l'analyse async (ne bloque plus le serveur)
+        # Lancer l'analyse async dans le worktree isolé
         result = await launch_claude_stream_json(
             prompt=prompt,
             request=request,
+            working_dir=working_dir,
             max_timeout=7200,
             verbosity=1
         )
@@ -404,10 +936,15 @@ async def run_claude_analysis(request: ClaudeRequest) -> None:
         log_to_stderr(f"[Job {job_id}] Analysis completed.\n")
 
     except Exception as e:
-        log_to_stderr(f"[Job {job_id}] Error: {e}\n")
+        error_msg = str(e)
+        log_to_stderr(f"[Job {job_id}] Error: {error_msg}\n")
+
+        # Envoyer l'erreur via WebSocket (pour les erreurs qui surviennent avant launch_claude_stream_json)
+        await send_error_to_websocket(job_id, error_msg)
+
         if job_id in jobs:
             jobs[job_id].status = JobStatus.FAILED
-            jobs[job_id].error = str(e)
+            jobs[job_id].error = error_msg
             jobs[job_id].completed_at = datetime.now()
 
 
@@ -429,6 +966,13 @@ async def launch_claude(request: ClaudeRequest):
     Returns:
         Informations sur le job créé
     """
+    # Vérifier l'action AVANT de créer le job
+    if not TEST_MODE and request.action != 'issue_detector':
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported action: {request.action}. Only 'issue_detector' is supported."
+        )
+
     # Vérifier si le job existe déjà
     if request.jobId in jobs:
         existing = jobs[request.jobId]
@@ -438,12 +982,8 @@ async def launch_claude(request: ClaudeRequest):
                 detail=f"Job {request.jobId} is already {existing.status.value}"
             )
 
-    # Changer de branche
-    if not switch_branch(request.branchName):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to switch to branch: {request.branchName}"
-        )
+    # Note: Le worktree est créé dans run_claude_analysis()
+    # Plus besoin de switch_branch() - chaque job a son worktree isolé
 
     # Logger les infos
     log_to_stderr(f"Lancement de Claude pour la branche: {request.branchName}\n")
@@ -460,15 +1000,17 @@ async def launch_claude(request: ClaudeRequest):
     )
 
     # Lancer en arrière-plan avec asyncio (non-bloquant)
-    if request.action == 'issue_detector':
+    if TEST_MODE:
+        # Mode test: envoie 1+1=2 puis un JSON de test
+        log_to_stderr("[TEST MODE] Using test analysis instead of Claude\n")
+        task = asyncio.create_task(run_test_analysis(request))
+        running_tasks.add(task)
+        task.add_done_callback(running_tasks.discard)
+    else:
+        # Action 'issue_detector' (déjà validée au début de la fonction)
         task = asyncio.create_task(run_claude_analysis(request))
         running_tasks.add(task)
         task.add_done_callback(running_tasks.discard)  # Nettoie quand terminé
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported action: {request.action}"
-        )
 
     return {
         "jobId": request.jobId,
@@ -520,3 +1062,63 @@ def list_jobs():
         ],
         "total": len(jobs)
     }
+
+
+# =============================================================================
+# Routes Admin (Worktrees)
+# =============================================================================
+
+@app.get("/admin/worktrees")
+def list_worktrees():
+    """
+    Liste tous les worktrees actifs.
+
+    Returns:
+        Liste des worktrees avec leur état
+    """
+    mgr = WorktreeManager()
+    worktrees = mgr.list_worktrees()
+    return {
+        "worktrees": worktrees,
+        "total": len(worktrees),
+        "base_path": str(mgr.base_path),
+        "ttl_hours": mgr.ttl / 3600
+    }
+
+
+@app.post("/admin/worktrees/cleanup")
+async def cleanup_worktrees():
+    """
+    Force le nettoyage des worktrees expirés.
+
+    Returns:
+        Nombre de worktrees nettoyés
+    """
+    cleaned = await async_cleanup_expired()
+    return {
+        "cleaned": cleaned,
+        "message": f"{cleaned} worktree(s) cleaned"
+    }
+
+
+@app.delete("/admin/worktrees/{commit_sha}")
+def delete_worktree(commit_sha: str):
+    """
+    Supprime un worktree spécifique.
+
+    Args:
+        commit_sha: Le SHA du commit (12 premiers caractères suffisent)
+
+    Returns:
+        Statut de la suppression
+    """
+    mgr = WorktreeManager()
+    success = mgr.cleanup_worktree(commit_sha)
+
+    if success:
+        return {"status": "deleted", "commit": commit_sha}
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete worktree for {commit_sha}"
+        )

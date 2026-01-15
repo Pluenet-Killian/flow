@@ -1,4 +1,4 @@
-# Rapport SonarQube - Résumé
+# Rapport SonarQube - Resume
 
 Commit: abc123 | Branche: feature/test | Date: 2025-12-12 11:14
 
@@ -6,9 +6,9 @@ Commit: abc123 | Branche: feature/test | Date: 2025-12-12 11:14
 
 ## Vue d'ensemble
 
-### Par sévérité
+### Par severite
 
-| Sévérité | Count |
+| Severite | Count |
 |----------|-------|
 | Blocker | 1 |
 | Critical | 1 |
@@ -17,9 +17,9 @@ Commit: abc123 | Branche: feature/test | Date: 2025-12-12 11:14
 | Info | 1 |
 | **Total** | **7** |
 
-### Par catégorie
+### Par categorie
 
-| Catégorie | Count |
+| Categorie | Count |
 |-----------|-------|
 | Security | 1 |
 | Reliability | 1 |
@@ -32,9 +32,9 @@ Commit: abc123 | Branche: feature/test | Date: 2025-12-12 11:14
 ### 1. Possible null pointer dereference in socket handler
 
 - **Fichier**: src/network/UDPServer.cpp:142
-- **Règle**: cpp:S2259
-- **Sévérité**: Blocker
-- **Catégorie**: Reliability
+- **Regle**: cpp:S2259
+- **Severite**: Blocker
+- **Categorie**: Reliability
 - **Effort**: 15min
 
 ---
@@ -44,9 +44,9 @@ Commit: abc123 | Branche: feature/test | Date: 2025-12-12 11:14
 ### 1. Hardcoded password detected: 'admin123'
 
 - **Fichier**: src/auth/Login.cpp:34
-- **Règle**: cpp:S2068
-- **Sévérité**: Critical
-- **Catégorie**: Security
+- **Regle**: cpp:S2068
+- **Severite**: Critical
+- **Categorie**: Security
 - **Effort**: 30min
 
 ---
@@ -56,30 +56,30 @@ Commit: abc123 | Branche: feature/test | Date: 2025-12-12 11:14
 ### 1. Function has too many parameters (8 > 7 allowed)
 
 - **Fichier**: src/ecs/Registry.hpp:12
-- **Règle**: cpp:S107
-- **Sévérité**: Major
-- **Catégorie**: Maintainability
+- **Regle**: cpp:S107
+- **Severite**: Major
+- **Categorie**: Maintainability
 - **Effort**: 1h
 
 ### 2. This class has 45 methods, which is greater than 20 authorized
 
 - **Fichier**: src/ecs/Registry.hpp:1
-- **Règle**: cpp:S1200
-- **Sévérité**: Major
-- **Catégorie**: Maintainability
+- **Regle**: cpp:S1200
+- **Severite**: Major
+- **Categorie**: Maintainability
 - **Effort**: 2h
 
 ### 3. Control flow statements nested too deeply (5 > 4 allowed)
 
 - **Fichier**: src/game/GameLoop.cpp:89
-- **Règle**: cpp:S134
-- **Sévérité**: Major
-- **Catégorie**: Maintainability
+- **Regle**: cpp:S134
+- **Severite**: Major
+- **Categorie**: Maintainability
 - **Effort**: 45min
 
 ---
 
-## Fichiers les plus impactés (top 20)
+## Fichiers les plus impactes (top 20)
 
 | Fichier | Blocker | Critical | Major | Minor | Total |
 |---------|---------|----------|-------|-------|-------|
@@ -92,9 +92,9 @@ Commit: abc123 | Branche: feature/test | Date: 2025-12-12 11:14
 
 ---
 
-## Règles les plus violées (top 20)
+## Regles les plus violees (top 20)
 
-| Règle | Description | Count |
+| Regle | Description | Count |
 |-------|-------------|-------|
 | cpp:S2259 | Null pointer dereference | 1 |
 | cpp:S2068 | Hardcoded credentials | 1 |
@@ -108,4 +108,4 @@ Commit: abc123 | Branche: feature/test | Date: 2025-12-12 11:14
 
 ## Fichier complet
 
-Détails complets disponibles dans : `.claude/tests/test_sonar_input.json`
+Details complets disponibles dans : `.claude/tests/test_sonar_input.json`

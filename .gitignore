@@ -1,6 +1,11 @@
 *.pyc
 env
 
+# Environment variables (credentials)
+.env
+.env.local
+.env.*.local
+
 .claude/agentdb/db.sqlite
 .claude/agentdb/db.sqlite-shm
 .claude/agentdb/db.sqlite-wal
@@ -16,3 +21,4 @@ env
 cpp-analyzer
 
 reports/*
+.venv-docs/

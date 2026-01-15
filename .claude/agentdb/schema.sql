@@ -578,3 +578,373 @@ CREATE TABLE IF NOT EXISTS index_checkpoints (
 
 -- Index sur le commit pour recherche rapide
 CREATE INDEX IF NOT EXISTS idx_index_checkpoints_commit ON index_checkpoints(last_commit);
+
+-- ============================================================================
+-- PILIER 7 : RECHERCHE SÉMANTIQUE (EMBEDDINGS)
+-- ============================================================================
+
+-- Embeddings des symboles (fonctions, classes, etc.)
+-- Utilise sentence-transformers pour générer des vecteurs de 384 dimensions
+CREATE TABLE IF NOT EXISTS symbol_embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol_id INTEGER NOT NULL UNIQUE,
+
+    -- Vecteur d'embedding (BLOB pour stockage compact)
+    -- Format: float32 array serialisé en bytes (384 * 4 = 1536 bytes)
+    embedding BLOB NOT NULL,
+
+    -- Métadonnées de l'embedding
+    model_name TEXT DEFAULT 'all-MiniLM-L6-v2',
+    model_version TEXT DEFAULT '1.0',
+    dimensions INTEGER DEFAULT 384,
+
+    -- Source du texte utilisé pour l'embedding
+    source_text_hash TEXT,  -- Hash du texte source pour invalidation
+
+    -- Timing
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT,
+
+    FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+);
+
+-- Embeddings des fichiers (pour recherche par fichier entier)
+CREATE TABLE IF NOT EXISTS file_embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL UNIQUE,
+
+    -- Vecteur d'embedding
+    embedding BLOB NOT NULL,
+
+    -- Métadonnées
+    model_name TEXT DEFAULT 'all-MiniLM-L6-v2',
+    model_version TEXT DEFAULT '1.0',
+    dimensions INTEGER DEFAULT 384,
+
+    -- Source
+    source_type TEXT DEFAULT 'docstrings',  -- docstrings, code, combined
+    source_text_hash TEXT,
+
+    -- Timing
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT,
+
+    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
+-- Cache de recherche sémantique (pour accélérer les requêtes répétées)
+CREATE TABLE IF NOT EXISTS semantic_search_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Requête
+    query_text TEXT NOT NULL,
+    query_hash TEXT UNIQUE NOT NULL,  -- MD5 de la requête normalisée
+    query_embedding BLOB NOT NULL,
+
+    -- Résultats (JSON array des top-k résultats)
+    results_json TEXT NOT NULL,
+    result_count INTEGER,
+
+    -- Configuration de la recherche
+    search_type TEXT DEFAULT 'symbol',  -- symbol, file, hybrid
+    top_k INTEGER DEFAULT 10,
+    threshold REAL DEFAULT 0.5,
+
+    -- Timing et validité
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT,  -- NULL = jamais expire
+    hit_count INTEGER DEFAULT 0,
+    last_hit_at TEXT
+);
+
+-- Index pour performance des embeddings
+CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_symbol ON symbol_embeddings(symbol_id);
+CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_model ON symbol_embeddings(model_name, model_version);
+CREATE INDEX IF NOT EXISTS idx_file_embeddings_file ON file_embeddings(file_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_cache_hash ON semantic_search_cache(query_hash);
+CREATE INDEX IF NOT EXISTS idx_semantic_cache_expires ON semantic_search_cache(expires_at);
+
+-- Vue : Symboles avec leurs embeddings
+CREATE VIEW IF NOT EXISTS v_symbols_with_embeddings AS
+SELECT
+    s.id,
+    s.name,
+    s.kind,
+    s.qualified_name,
+    s.doc_comment,
+    s.signature,
+    f.path as file_path,
+    f.module,
+    CASE WHEN se.id IS NOT NULL THEN 1 ELSE 0 END as has_embedding
+FROM symbols s
+JOIN files f ON s.file_id = f.id
+LEFT JOIN symbol_embeddings se ON se.symbol_id = s.id;
+
+-- Vue : Statistiques des embeddings
+CREATE VIEW IF NOT EXISTS v_embedding_stats AS
+SELECT
+    'symbols' as type,
+    COUNT(*) as total,
+    (SELECT COUNT(*) FROM symbol_embeddings) as with_embedding,
+    ROUND(100.0 * (SELECT COUNT(*) FROM symbol_embeddings) / NULLIF(COUNT(*), 0), 2) as coverage_percent
+FROM symbols
+WHERE kind IN ('function', 'method', 'class', 'struct')
+UNION ALL
+SELECT
+    'files' as type,
+    COUNT(*) as total,
+    (SELECT COUNT(*) FROM file_embeddings) as with_embedding,
+    ROUND(100.0 * (SELECT COUNT(*) FROM file_embeddings) / NULLIF(COUNT(*), 0), 2) as coverage_percent
+FROM files;
+
+-- ============================================================================
+-- PILIER 8 : PATTERN LEARNING (Apprentissage automatique)
+-- ============================================================================
+
+-- Patterns appris automatiquement à partir de l'historique
+CREATE TABLE IF NOT EXISTS learned_patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Identification
+    pattern_hash TEXT UNIQUE NOT NULL,  -- Hash unique du pattern
+    name TEXT NOT NULL,                  -- Nom généré ou assigné
+    category TEXT NOT NULL,              -- error_prone, performance, security, style
+
+    -- Description
+    description TEXT NOT NULL,
+    detection_rule TEXT,                 -- Règle de détection (regex, AST query, etc.)
+    detection_type TEXT DEFAULT 'heuristic',  -- heuristic, ast_pattern, ml_model
+
+    -- Contexte
+    language TEXT,                       -- Langage concerné (NULL = tous)
+    file_pattern TEXT,                   -- Pattern de fichiers concernés
+    symbol_kind TEXT,                    -- Type de symbole (function, class, etc.)
+
+    -- Statistiques
+    occurrence_count INTEGER DEFAULT 0,  -- Nombre de fois détecté
+    fix_count INTEGER DEFAULT 0,         -- Nombre de fois corrigé
+    false_positive_count INTEGER DEFAULT 0,
+    confidence_score REAL DEFAULT 0.5,   -- Score de confiance (0-1)
+
+    -- Exemple
+    example_bad TEXT,                    -- Exemple de code problématique
+    example_good TEXT,                   -- Exemple de correction
+    example_file TEXT,                   -- Fichier d'exemple
+
+    -- Métadonnées
+    source TEXT DEFAULT 'auto',          -- auto, manual, imported
+    is_active BOOLEAN DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT,
+    last_detected_at TEXT,
+
+    -- Liens
+    related_error_types_json TEXT,       -- Types d'erreurs associés
+    related_patterns_json TEXT           -- Patterns similaires
+);
+
+-- Occurrences de patterns détectés
+CREATE TABLE IF NOT EXISTS pattern_occurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Liens
+    pattern_id INTEGER NOT NULL,
+    file_id INTEGER,
+    symbol_id INTEGER,
+
+    -- Localisation
+    file_path TEXT NOT NULL,
+    line_start INTEGER,
+    line_end INTEGER,
+    code_snippet TEXT,                   -- Extrait de code concerné
+
+    -- Contexte
+    commit_hash TEXT,                    -- Commit où détecté
+    branch TEXT,
+
+    -- Statut
+    status TEXT DEFAULT 'detected',      -- detected, confirmed, fixed, false_positive
+    fixed_at TEXT,
+    fixed_by TEXT,
+    fix_commit TEXT,
+
+    -- Métadonnées
+    detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+    detection_context_json TEXT,         -- Contexte additionnel
+
+    FOREIGN KEY (pattern_id) REFERENCES learned_patterns(id) ON DELETE CASCADE,
+    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE SET NULL,
+    FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
+);
+
+-- Historique des corrections (pour apprendre des fixes)
+CREATE TABLE IF NOT EXISTS fix_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Identification
+    fix_hash TEXT UNIQUE,                -- Hash du fix pour déduplication
+
+    -- Contexte de l'erreur
+    error_type TEXT NOT NULL,
+    error_file TEXT NOT NULL,
+    error_line INTEGER,
+    error_description TEXT,
+
+    -- Code avant/après
+    code_before TEXT NOT NULL,
+    code_after TEXT NOT NULL,
+    diff_unified TEXT,                   -- Diff au format unifié
+
+    -- Contexte Git
+    commit_hash TEXT,
+    commit_message TEXT,
+    commit_author TEXT,
+    commit_date TEXT,
+
+    -- Classification
+    fix_type TEXT,                       -- refactor, bugfix, security, performance
+    complexity TEXT DEFAULT 'simple',    -- simple, moderate, complex
+    breaking_change BOOLEAN DEFAULT 0,
+
+    -- Apprentissage
+    learned_pattern_id INTEGER,          -- Pattern appris de ce fix
+    similar_fixes_json TEXT,             -- Fixes similaires trouvés
+
+    -- Métadonnées
+    recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
+    source TEXT DEFAULT 'git',           -- git, manual, import
+
+    FOREIGN KEY (learned_pattern_id) REFERENCES learned_patterns(id) ON DELETE SET NULL
+);
+
+-- Code smells détectés (anti-patterns courants)
+CREATE TABLE IF NOT EXISTS code_smells (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Localisation
+    file_id INTEGER,
+    file_path TEXT NOT NULL,
+    symbol_id INTEGER,
+    symbol_name TEXT,
+    line_start INTEGER,
+    line_end INTEGER,
+
+    -- Classification
+    smell_type TEXT NOT NULL,            -- long_method, god_class, duplicate_code, etc.
+    severity TEXT DEFAULT 'medium',      -- low, medium, high, critical
+    confidence REAL DEFAULT 0.7,
+
+    -- Description
+    description TEXT,
+    suggestion TEXT,                     -- Suggestion de correction
+    estimated_effort TEXT,               -- quick, moderate, significant
+
+    -- Métriques associées
+    metrics_json TEXT,                   -- Métriques qui ont déclenché la détection
+
+    -- Statut
+    status TEXT DEFAULT 'open',          -- open, acknowledged, fixed, wont_fix
+    fixed_at TEXT,
+
+    -- Métadonnées
+    detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at TEXT,
+    occurrence_count INTEGER DEFAULT 1,
+
+    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE SET NULL,
+    FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
+);
+
+-- Feedback utilisateur pour améliorer l'apprentissage
+CREATE TABLE IF NOT EXISTS learning_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Sujet du feedback
+    feedback_type TEXT NOT NULL,         -- pattern, smell, suggestion, fix
+    target_type TEXT NOT NULL,           -- learned_pattern, code_smell, pattern_occurrence
+    target_id INTEGER NOT NULL,
+
+    -- Feedback
+    is_helpful BOOLEAN,                  -- Le pattern/suggestion était utile ?
+    is_accurate BOOLEAN,                 -- La détection était correcte ?
+    rating INTEGER,                      -- Score 1-5
+
+    -- Commentaire
+    comment TEXT,
+    suggested_improvement TEXT,
+
+    -- Contexte
+    user_id TEXT,
+    session_id TEXT,
+
+    -- Métadonnées
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Index pour pattern learning
+CREATE INDEX IF NOT EXISTS idx_learned_patterns_category ON learned_patterns(category);
+CREATE INDEX IF NOT EXISTS idx_learned_patterns_language ON learned_patterns(language);
+CREATE INDEX IF NOT EXISTS idx_learned_patterns_confidence ON learned_patterns(confidence_score);
+CREATE INDEX IF NOT EXISTS idx_learned_patterns_active ON learned_patterns(is_active);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_occurrences_pattern ON pattern_occurrences(pattern_id);
+CREATE INDEX IF NOT EXISTS idx_pattern_occurrences_file ON pattern_occurrences(file_id);
+CREATE INDEX IF NOT EXISTS idx_pattern_occurrences_status ON pattern_occurrences(status);
+CREATE INDEX IF NOT EXISTS idx_pattern_occurrences_detected ON pattern_occurrences(detected_at);
+
+CREATE INDEX IF NOT EXISTS idx_fix_history_error_type ON fix_history(error_type);
+CREATE INDEX IF NOT EXISTS idx_fix_history_commit ON fix_history(commit_hash);
+CREATE INDEX IF NOT EXISTS idx_fix_history_learned ON fix_history(learned_pattern_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_smells_file ON code_smells(file_id);
+CREATE INDEX IF NOT EXISTS idx_code_smells_type ON code_smells(smell_type);
+CREATE INDEX IF NOT EXISTS idx_code_smells_severity ON code_smells(severity);
+CREATE INDEX IF NOT EXISTS idx_code_smells_status ON code_smells(status);
+
+CREATE INDEX IF NOT EXISTS idx_learning_feedback_target ON learning_feedback(target_type, target_id);
+
+-- Vue : Patterns les plus fréquents
+CREATE VIEW IF NOT EXISTS v_top_patterns AS
+SELECT
+    lp.id,
+    lp.name,
+    lp.category,
+    lp.occurrence_count,
+    lp.fix_count,
+    lp.confidence_score,
+    ROUND(100.0 * lp.fix_count / NULLIF(lp.occurrence_count, 0), 1) as fix_rate,
+    COUNT(po.id) as active_occurrences
+FROM learned_patterns lp
+LEFT JOIN pattern_occurrences po ON po.pattern_id = lp.id AND po.status = 'detected'
+WHERE lp.is_active = 1
+GROUP BY lp.id
+ORDER BY lp.occurrence_count DESC;
+
+-- Vue : Code smells par fichier
+CREATE VIEW IF NOT EXISTS v_smells_by_file AS
+SELECT
+    f.path,
+    f.module,
+    COUNT(cs.id) as smell_count,
+    SUM(CASE WHEN cs.severity = 'critical' THEN 1 ELSE 0 END) as critical_count,
+    SUM(CASE WHEN cs.severity = 'high' THEN 1 ELSE 0 END) as high_count,
+    GROUP_CONCAT(DISTINCT cs.smell_type) as smell_types
+FROM files f
+JOIN code_smells cs ON cs.file_id = f.id
+WHERE cs.status = 'open'
+GROUP BY f.id
+ORDER BY critical_count DESC, high_count DESC, smell_count DESC;
+
+-- Vue : Efficacité du learning
+CREATE VIEW IF NOT EXISTS v_learning_effectiveness AS
+SELECT
+    lp.category,
+    COUNT(DISTINCT lp.id) as pattern_count,
+    SUM(lp.occurrence_count) as total_occurrences,
+    SUM(lp.fix_count) as total_fixes,
+    AVG(lp.confidence_score) as avg_confidence,
+    SUM(lp.false_positive_count) as total_false_positives,
+    ROUND(100.0 * SUM(lp.false_positive_count) / NULLIF(SUM(lp.occurrence_count), 0), 2) as false_positive_rate
+FROM learned_patterns lp
+WHERE lp.is_active = 1
+GROUP BY lp.category;

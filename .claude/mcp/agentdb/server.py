@@ -1,32 +1,30 @@
 """
-AgentDB MCP Server - Serveur principal.
+AgentDB MCP Server v6 "Lean" - Serveur optimisé pour compléter LSP.
 
-Ce module implémente le serveur MCP qui expose AgentDB aux agents Claude.
+Ce module implémente le serveur MCP qui expose UNIQUEMENT les fonctionnalités
+que LSP ne fournit pas nativement dans Claude Code.
 
-Architecture :
-- Transport : stdio (JSON-RPC 2.0)
-- Protocole : MCP (Model Context Protocol)
-- Backend : SQLite via le module agentdb
+Architecture v6 "Lean":
+- 12 outils MCP focalisés sur la valeur ajoutée
+- LSP natif pour: navigation, références, call hierarchy, symbols
+- AgentDB pour: contexte historique, sémantique, learning, métriques
 
-Le serveur gère :
-- L'initialisation de la connexion DB
-- L'enregistrement des 10 outils MCP
-- Le dispatch des requêtes JSON-RPC
-- La gestion des erreurs
+Outils supprimés (redondants avec LSP):
+- get_symbol_callers -> LSP incomingCalls
+- get_symbol_callees -> LSP outgoingCalls
+- get_file_impact -> LSP findReferences + enrichissement minimal
+- search_symbols -> LSP workspaceSymbol
+- smart_references -> LSP findReferences
+- smart_callers -> LSP incomingCalls
+- impact_analysis_v2 -> LSP + get_risk_assessment
+- smart_search -> LSP workspaceSymbol
+- parse_file -> LSP documentSymbol
+- get_supported_languages -> Non nécessaire runtime
+- get_embedding_stats -> Debug only
+- get_learning_stats -> Debug only
 
 Usage:
-    # Via CLI
     python -m mcp.agentdb.server
-
-    # Programmatique
-    server = AgentDBServer()
-    asyncio.run(server.run())
-
-    # Avec config personnalisée
-    server = AgentDBServer(
-        db_path=".claude/agentdb/db.sqlite",
-        config_path=".claude/config/agentdb.yaml"
-    )
 """
 
 from __future__ import annotations
@@ -48,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 logging.basicConfig(
     level=os.environ.get("AGENTDB_LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    stream=sys.stderr  # Log sur stderr pour ne pas polluer stdout (utilisé par MCP)
+    stream=sys.stderr
 )
 logger = logging.getLogger("agentdb.mcp.server")
 
@@ -57,8 +55,7 @@ logger = logging.getLogger("agentdb.mcp.server")
 # CONSTANTS
 # =============================================================================
 
-# Version du serveur
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "6.0.0"  # v6 Lean - Optimisé pour compléter LSP
 SERVER_NAME = "agentdb"
 
 # Codes d'erreur JSON-RPC
@@ -76,461 +73,39 @@ FILE_NOT_FOUND = -32003
 
 
 # =============================================================================
-# TOOL DEFINITIONS (10 outils MCP)
+# TOOL DEFINITIONS v6 LEAN (12 outils)
 # =============================================================================
 
 TOOL_DEFINITIONS = [
+    # =========================================================================
+    # CONTEXTE & HISTORIQUE (Ce que LSP ne sait pas)
+    # =========================================================================
+
     # 1. get_file_context - Vue 360° d'un fichier
     {
         "name": "get_file_context",
-        "description": """Récupère le contexte complet d'un fichier : métadonnées, symboles définis,
-dépendances (includes/imports et appelants), historique d'erreurs associé,
-métriques de code (complexité, lignes), et patterns applicables.
+        "description": """Contexte complet d'un fichier : métadonnées, historique d'erreurs,
+métriques de code, et patterns applicables.
 
-C'est l'outil principal pour comprendre un fichier avant de le modifier.
-Répond à : "Qu'est-ce que ce fichier ? Qui l'utilise ? Quels problèmes passés ?"
+QUAND L'UTILISER: Avant de modifier un fichier, pour comprendre son contexte.
 
-Exemple de retour:
+NOTE: Pour les symboles et dépendances, utilisez LSP:
+- LSP documentSymbol: liste des symboles
+- LSP findReferences: qui utilise ce fichier
+
+Ce que cet outil ajoute vs LSP:
+- Historique des bugs/erreurs passés
+- Métriques (complexité, lignes, risque)
+- Patterns de code à respecter
+- Activité Git (qui, quand, combien)
+
+Exemple:
 {
-  "file": {"path": "src/lcd/init.c", "module": "lcd", "language": "c", ...},
-  "symbols": [{"name": "lcd_init", "kind": "function", "line": 42, ...}],
-  "dependencies": {"includes": [...], "included_by": [...], "callers": [...]},
-  "error_history": [{"type": "null_pointer", "date": "2024-01-15", ...}],
-  "metrics": {"complexity": 15, "lines_code": 127, ...},
+  "file": {"path": "src/lcd/init.c", "module": "lcd", "language": "c"},
+  "error_history": [{"type": "null_pointer", "date": "2024-01-15", "fixed": true}],
+  "metrics": {"complexity": 15, "lines_code": 127, "risk_score": 0.6},
+  "git_activity": {"commits_30d": 5, "contributors": ["alice", "bob"]},
   "patterns": [{"name": "error_handling", "description": "..."}]
-}""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Chemin du fichier relatif à la racine du projet"
-                },
-                "include_symbols": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Inclure la liste des symboles définis dans le fichier"
-                },
-                "include_dependencies": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Inclure les dépendances (includes, appelants, appelés)"
-                },
-                "include_history": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Inclure l'historique des erreurs/bugs"
-                },
-                "include_patterns": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Inclure les patterns de code applicables"
-                }
-            },
-            "required": ["path"]
-        }
-    },
-
-    # 2. get_symbol_callers - Qui appelle ce symbole ?
-    {
-        "name": "get_symbol_callers",
-        "description": """Trouve tous les symboles qui appellent le symbole donné,
-avec traversée récursive jusqu'à une profondeur configurable.
-
-Essentiel pour l'analyse d'impact : "Si je modifie cette fonction,
-quels autres fichiers/fonctions seront affectés ?"
-
-Retourne les appelants groupés par niveau (level_1 = appelants directs,
-level_2 = appelants des appelants, etc.).
-
-Exemple:
-{
-  "symbol": {"name": "lcd_write", "file": "src/lcd/io.c"},
-  "callers": {
-    "level_1": [{"name": "lcd_print", "file": "src/lcd/print.c", "line": 45}],
-    "level_2": [{"name": "display_message", "file": "src/ui/display.c"}]
-  },
-  "summary": {"total": 15, "max_depth_reached": 2, "critical_callers": 3}
-}""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "symbol_name": {
-                    "type": "string",
-                    "description": "Nom du symbole (fonction, variable globale, macro)"
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "Fichier contenant le symbole (pour désambiguïser si plusieurs symboles ont le même nom)"
-                },
-                "max_depth": {
-                    "type": "integer",
-                    "default": 3,
-                    "minimum": 1,
-                    "maximum": 10,
-                    "description": "Profondeur maximale de traversée récursive"
-                },
-                "include_indirect": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Inclure les appels indirects (via pointeurs de fonction)"
-                }
-            },
-            "required": ["symbol_name"]
-        }
-    },
-
-    # 3. get_symbol_callees - Qu'est-ce que ce symbole appelle ?
-    {
-        "name": "get_symbol_callees",
-        "description": """Trouve tous les symboles appelés par le symbole donné.
-
-Utile pour comprendre les dépendances d'une fonction :
-"Quelles fonctions cette fonction utilise-t-elle ?"
-
-Inclut également les types utilisés (paramètres, retour, variables locales).
-
-Exemple:
-{
-  "symbol": {"name": "lcd_init", "file": "src/lcd/init.c"},
-  "callees": {
-    "level_1": [
-      {"name": "gpio_configure", "file": "src/hal/gpio.c"},
-      {"name": "delay_ms", "file": "src/hal/time.c"}
-    ]
-  },
-  "types_used": [
-    {"name": "LCD_Config", "file": "src/lcd/types.h", "usage": "parameter"}
-  ]
-}""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "symbol_name": {
-                    "type": "string",
-                    "description": "Nom du symbole"
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "Fichier contenant le symbole (optionnel, pour désambiguïser)"
-                },
-                "max_depth": {
-                    "type": "integer",
-                    "default": 2,
-                    "minimum": 1,
-                    "maximum": 5,
-                    "description": "Profondeur de traversée (généralement 1-2 suffit)"
-                }
-            },
-            "required": ["symbol_name"]
-        }
-    },
-
-    # 4. get_file_impact - Impact d'une modification de fichier
-    {
-        "name": "get_file_impact",
-        "description": """Calcule l'impact complet de la modification d'un fichier.
-
-Combine plusieurs sources d'impact :
-1. Fichiers qui #include ce fichier (impact direct sur les headers)
-2. Fichiers dont les symboles appellent des symboles de ce fichier
-3. Impact transitif (fichiers impactés par les fichiers impactés)
-
-Répond à : "Si je modifie ce fichier, quoi d'autre pourrait casser ?"
-
-Exemple:
-{
-  "file": "src/lcd/types.h",
-  "direct_impact": [
-    {"file": "src/lcd/init.c", "reason": "includes types.h"},
-    {"file": "src/lcd/write.c", "reason": "calls lcd_config_t"}
-  ],
-  "transitive_impact": [
-    {"file": "src/main.c", "reason": "includes init.c", "depth": 2}
-  ],
-  "summary": {
-    "total_files_impacted": 12,
-    "critical_files_impacted": 2,
-    "test_files_impacted": 3
-  }
-}""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Chemin du fichier à analyser"
-                },
-                "include_transitive": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Inclure les impacts de niveau 2+ (transitifs)"
-                },
-                "max_depth": {
-                    "type": "integer",
-                    "default": 3,
-                    "minimum": 1,
-                    "maximum": 5,
-                    "description": "Profondeur max pour l'impact transitif"
-                }
-            },
-            "required": ["path"]
-        }
-    },
-
-    # 5. get_error_history - Historique des erreurs
-    {
-        "name": "get_error_history",
-        "description": """Récupère l'historique des erreurs/bugs associés à un fichier,
-un symbole, ou un module entier.
-
-Utile pour :
-- Identifier les zones à risque ("ce fichier a eu 5 bugs memory_leak")
-- Comprendre les problèmes récurrents
-- Contextualiser une revue de code
-
-Exemple:
-{
-  "query": {"file_path": "src/lcd/write.c"},
-  "errors": [
-    {
-      "id": 42,
-      "type": "buffer_overflow",
-      "severity": "critical",
-      "description": "Overflow dans lcd_write_string",
-      "date_reported": "2024-01-15",
-      "date_fixed": "2024-01-16",
-      "commit_fix": "abc123",
-      "symbol_name": "lcd_write_string",
-      "line": 78
-    }
-  ],
-  "summary": {
-    "total": 3,
-    "by_type": {"buffer_overflow": 1, "null_pointer": 2},
-    "by_severity": {"critical": 1, "medium": 2}
-  }
-}""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Filtrer par fichier spécifique"
-                },
-                "symbol_name": {
-                    "type": "string",
-                    "description": "Filtrer par symbole spécifique"
-                },
-                "module": {
-                    "type": "string",
-                    "description": "Filtrer par module (ex: 'lcd', 'hal')"
-                },
-                "error_type": {
-                    "type": "string",
-                    "description": "Filtrer par type d'erreur (ex: 'null_pointer', 'buffer_overflow')"
-                },
-                "severity": {
-                    "type": "string",
-                    "enum": ["critical", "high", "medium", "low"],
-                    "description": "Sévérité minimum à inclure"
-                },
-                "days": {
-                    "type": "integer",
-                    "default": 180,
-                    "description": "Période à considérer (en jours)"
-                },
-                "limit": {
-                    "type": "integer",
-                    "default": 20,
-                    "description": "Nombre maximum de résultats"
-                }
-            }
-        }
-    },
-
-    # 6. get_patterns - Patterns de code applicables
-    {
-        "name": "get_patterns",
-        "description": """Récupère les patterns de code applicables à un fichier ou module.
-
-Les patterns définissent les conventions et bonnes pratiques à suivre :
-- error_handling : Comment gérer les erreurs dans ce module
-- naming : Conventions de nommage
-- memory : Règles d'allocation/libération mémoire
-- documentation : Standards de documentation
-
-Exemple:
-{
-  "query": {"file_path": "src/lcd/init.c"},
-  "patterns": [
-    {
-      "name": "error_handling",
-      "category": "reliability",
-      "description": "Toute fonction qui peut échouer doit retourner un code d'erreur",
-      "example": "int lcd_init(LCD_Config* cfg) { if (!cfg) return LCD_ERR_NULL; ... }",
-      "severity": "high"
-    },
-    {
-      "name": "resource_cleanup",
-      "category": "memory",
-      "description": "Les ressources allouées doivent être libérées en cas d'erreur",
-      "example": "voir src/lcd/cleanup.c:lcd_cleanup_on_error"
-    }
-  ]
-}""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Fichier pour lequel récupérer les patterns applicables"
-                },
-                "module": {
-                    "type": "string",
-                    "description": "Module pour lequel récupérer les patterns"
-                },
-                "category": {
-                    "type": "string",
-                    "enum": ["error_handling", "memory", "naming", "documentation", "security", "performance"],
-                    "description": "Catégorie de patterns à récupérer"
-                },
-                "include_examples": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Inclure des exemples de code"
-                }
-            }
-        }
-    },
-
-    # 7. get_architecture_decisions - ADRs applicables
-    {
-        "name": "get_architecture_decisions",
-        "description": """Récupère les Architecture Decision Records (ADR) applicables.
-
-Les ADRs documentent les décisions architecturales importantes :
-- Pourquoi ce choix a été fait
-- Quelles alternatives ont été considérées
-- Quel est le contexte
-
-Exemple:
-{
-  "query": {"module": "lcd"},
-  "decisions": [
-    {
-      "id": "ADR-003",
-      "title": "Utilisation d'un buffer double pour l'affichage LCD",
-      "status": "accepted",
-      "date": "2023-06-15",
-      "context": "L'affichage direct cause du scintillement",
-      "decision": "Implémenter un double buffering",
-      "consequences": "Utilisation mémoire doublée, mais affichage fluide",
-      "applies_to": ["src/lcd/*"]
-    }
-  ]
-}""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "module": {
-                    "type": "string",
-                    "description": "Filtrer par module concerné"
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "Filtrer par fichier concerné"
-                },
-                "status": {
-                    "type": "string",
-                    "enum": ["accepted", "proposed", "deprecated", "superseded"],
-                    "default": "accepted",
-                    "description": "Statut des décisions à inclure"
-                },
-                "include_superseded": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Inclure les décisions remplacées"
-                }
-            }
-        }
-    },
-
-    # 8. search_symbols - Recherche de symboles
-    {
-        "name": "search_symbols",
-        "description": """Recherche des symboles par nom, type, ou pattern.
-
-Supporte les wildcards (* pour plusieurs caractères, ? pour un seul).
-
-Exemple:
-{
-  "query": "lcd_*",
-  "results": [
-    {"name": "lcd_init", "kind": "function", "file": "src/lcd/init.c", "line": 42},
-    {"name": "lcd_write", "kind": "function", "file": "src/lcd/io.c", "line": 15},
-    {"name": "LCD_Config", "kind": "struct", "file": "src/lcd/types.h", "line": 8}
-  ],
-  "total": 3
-}""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Pattern de recherche (supporte * et ? comme wildcards)"
-                },
-                "kind": {
-                    "type": "string",
-                    "enum": ["function", "struct", "class", "enum", "macro", "variable", "typedef"],
-                    "description": "Type de symbole à rechercher"
-                },
-                "module": {
-                    "type": "string",
-                    "description": "Limiter la recherche à un module"
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "Limiter la recherche à un fichier"
-                },
-                "limit": {
-                    "type": "integer",
-                    "default": 50,
-                    "minimum": 1,
-                    "maximum": 200,
-                    "description": "Nombre maximum de résultats"
-                }
-            },
-            "required": ["query"]
-        }
-    },
-
-    # 9. get_file_metrics - Métriques détaillées
-    {
-        "name": "get_file_metrics",
-        "description": """Récupère les métriques détaillées d'un fichier.
-
-Inclut :
-- Métriques de taille (lignes total, code, commentaires, blanches)
-- Métriques de complexité (cyclomatique, par fonction)
-- Activité Git (commits récents, contributeurs)
-- Score de risque calculé
-
-Exemple:
-{
-  "file": "src/lcd/write.c",
-  "metrics": {
-    "lines": {"total": 250, "code": 180, "comment": 45, "blank": 25},
-    "complexity": {"sum": 45, "avg": 9, "max": 18, "functions_over_10": 2},
-    "git": {
-      "commits_30d": 5,
-      "commits_90d": 12,
-      "contributors": ["alice", "bob"],
-      "last_modified": "2024-01-20"
-    },
-    "risk_score": 0.65,
-    "risk_factors": ["high_complexity", "frequent_changes", "past_bugs"]
-  }
 }""",
         "inputSchema": {
             "type": "object",
@@ -539,68 +114,438 @@ Exemple:
                     "type": "string",
                     "description": "Chemin du fichier"
                 },
-                "include_per_function": {
+                "include_history": {
                     "type": "boolean",
-                    "default": False,
-                    "description": "Inclure les métriques par fonction (plus détaillé)"
+                    "default": True,
+                    "description": "Inclure l'historique des erreurs"
+                },
+                "include_patterns": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Inclure les patterns applicables"
                 }
             },
             "required": ["path"]
         }
     },
 
-    # 10. get_module_summary - Résumé d'un module
+    # 2. get_error_history - Historique des erreurs
     {
-        "name": "get_module_summary",
-        "description": """Récupère un résumé complet d'un module (ensemble de fichiers).
+        "name": "get_error_history",
+        "description": """Historique des bugs/erreurs associés à un fichier, symbole, ou module.
 
-Agrège les informations de tous les fichiers du module :
-- Liste des fichiers
-- Statistiques globales
-- Symboles publics (API du module)
-- Dépendances inter-modules
-- Historique des erreurs agrégé
+QUAND L'UTILISER: Pour identifier les zones à risque, comprendre les problèmes récurrents.
+
+Ce que LSP ne fait pas:
+- Mémoire des bugs passés
+- Corrélation erreur/fichier/symbole
+- Statistiques de fiabilité
 
 Exemple:
 {
-  "module": "lcd",
-  "files": ["src/lcd/init.c", "src/lcd/write.c", "src/lcd/types.h"],
-  "stats": {
-    "total_files": 5,
-    "total_lines": 850,
-    "total_functions": 23,
-    "avg_complexity": 8.5
-  },
-  "public_api": [
-    {"name": "lcd_init", "signature": "int lcd_init(LCD_Config*)"},
-    {"name": "lcd_write", "signature": "int lcd_write(const char*, size_t)"}
+  "errors": [
+    {
+      "type": "buffer_overflow",
+      "severity": "critical",
+      "description": "Overflow dans lcd_write_string",
+      "date_reported": "2024-01-15",
+      "date_fixed": "2024-01-16",
+      "symbol_name": "lcd_write_string"
+    }
   ],
-  "dependencies": {
-    "uses": ["hal", "utils"],
-    "used_by": ["ui", "main"]
-  },
-  "health": {
-    "error_count_90d": 3,
-    "test_coverage": 78,
-    "documentation_score": 85
+  "summary": {"total": 3, "by_type": {"buffer_overflow": 1, "null_pointer": 2}}
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Filtrer par fichier"},
+                "symbol_name": {"type": "string", "description": "Filtrer par symbole"},
+                "module": {"type": "string", "description": "Filtrer par module"},
+                "error_type": {"type": "string", "description": "Type d'erreur"},
+                "severity": {
+                    "type": "string",
+                    "enum": ["critical", "high", "medium", "low"]
+                },
+                "days": {"type": "integer", "default": 180},
+                "limit": {"type": "integer", "default": 20}
+            }
+        }
+    },
+
+    # 3. get_patterns - Patterns de code
+    {
+        "name": "get_patterns",
+        "description": """Patterns et conventions de code applicables à un fichier/module.
+
+QUAND L'UTILISER: Avant d'écrire du code, pour respecter les conventions du projet.
+
+Ce que LSP ne fait pas:
+- Documentation des conventions de code
+- Patterns métier spécifiques
+- Exemples de code à suivre
+
+Exemple:
+{
+  "patterns": [
+    {
+      "name": "error_handling",
+      "category": "reliability",
+      "description": "Retourner un code d'erreur, jamais NULL",
+      "example": "int lcd_init() { if (!cfg) return LCD_ERR_NULL; }"
+    }
+  ]
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "module": {"type": "string"},
+                "category": {
+                    "type": "string",
+                    "enum": ["error_handling", "memory", "naming", "documentation", "security", "performance"]
+                },
+                "include_examples": {"type": "boolean", "default": True}
+            }
+        }
+    },
+
+    # 4. get_architecture_decisions - ADRs
+    {
+        "name": "get_architecture_decisions",
+        "description": """Architecture Decision Records (ADR) applicables.
+
+QUAND L'UTILISER: Pour comprendre POURQUOI le code est structuré ainsi.
+
+Ce que LSP ne fait pas:
+- Mémoire des décisions architecturales
+- Contexte et alternatives considérées
+- Conséquences documentées
+
+Exemple:
+{
+  "decisions": [
+    {
+      "id": "ADR-003",
+      "title": "Double buffering pour LCD",
+      "status": "accepted",
+      "context": "L'affichage direct cause du scintillement",
+      "decision": "Implémenter un double buffering",
+      "consequences": "Mémoire doublée mais affichage fluide"
+    }
+  ]
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string"},
+                "file_path": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["accepted", "proposed", "deprecated", "superseded"],
+                    "default": "accepted"
+                }
+            }
+        }
+    },
+
+    # =========================================================================
+    # MÉTRIQUES & RISQUE (Analyse quantitative)
+    # =========================================================================
+
+    # 5. get_file_metrics - Métriques détaillées
+    {
+        "name": "get_file_metrics",
+        "description": """Métriques détaillées et score de risque d'un fichier.
+
+QUAND L'UTILISER: Pour évaluer la qualité/complexité avant modification.
+
+Ce que LSP ne fait pas:
+- Complexité cyclomatique
+- Score de risque calculé
+- Activité Git historique
+- Corrélation métriques/bugs
+
+Exemple:
+{
+  "metrics": {
+    "lines": {"total": 250, "code": 180, "comment": 45},
+    "complexity": {"sum": 45, "avg": 9, "max": 18},
+    "git": {"commits_30d": 5, "contributors": ["alice"]},
+    "risk_score": 0.65,
+    "risk_factors": ["high_complexity", "frequent_changes"]
   }
 }""",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "module": {
-                    "type": "string",
-                    "description": "Nom du module (correspond généralement au sous-dossier dans src/)"
-                },
-                "include_private": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Inclure les symboles privés (static) dans le résumé"
-                }
+                "path": {"type": "string", "description": "Chemin du fichier"},
+                "include_per_function": {"type": "boolean", "default": False}
+            },
+            "required": ["path"]
+        }
+    },
+
+    # 6. get_module_summary - Résumé d'un module
+    {
+        "name": "get_module_summary",
+        "description": """Résumé complet d'un module (ensemble de fichiers).
+
+QUAND L'UTILISER: Pour comprendre un module entier rapidement.
+
+Ce que LSP ne fait pas:
+- Agrégation par module
+- Statistiques globales
+- Santé du module (bugs, couverture)
+- Dépendances inter-modules
+
+Exemple:
+{
+  "module": "lcd",
+  "files": ["init.c", "write.c", "types.h"],
+  "stats": {"total_files": 5, "total_lines": 850, "avg_complexity": 8.5},
+  "dependencies": {"uses": ["hal"], "used_by": ["ui"]},
+  "health": {"error_count_90d": 3, "risk_score": 0.4}
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string", "description": "Nom du module"},
+                "include_private": {"type": "boolean", "default": False}
             },
             "required": ["module"]
         }
+    },
+
+    # 7. get_risk_assessment - Évaluation de risque multi-fichiers
+    {
+        "name": "get_risk_assessment",
+        "description": """Évalue le risque d'un ensemble de modifications (pour PR review).
+
+QUAND L'UTILISER: Avant de merger une PR, pour évaluer le risque global.
+
+Ce que LSP ne fait pas:
+- Score de risque agrégé
+- Identification des fichiers critiques
+- Recommandations basées sur l'historique
+
+Exemple:
+{
+  "files": [
+    {"file": "src/core.py", "risk_score": 65, "is_critical": true},
+    {"file": "src/utils.py", "risk_score": 20}
+  ],
+  "overall_risk_score": 42.5,
+  "risk_factors": ["Critical file modified", "High complexity"],
+  "recommendations": ["Review core.py changes carefully", "Add tests"]
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Liste des fichiers modifiés"
+                },
+                "include_recommendations": {"type": "boolean", "default": True}
+            },
+            "required": ["file_paths"]
+        }
+    },
+
+    # =========================================================================
+    # RECHERCHE SÉMANTIQUE (Ce que LSP ne peut pas faire)
+    # =========================================================================
+
+    # 8. semantic_search - Recherche en langage naturel
+    {
+        "name": "semantic_search",
+        "description": """Recherche de code par description en langage naturel.
+
+QUAND L'UTILISER: Quand vous ne connaissez pas le nom exact.
+- "Trouve les fonctions qui gèrent l'authentification"
+- "Code qui parse du JSON"
+- "Fonctions de validation d'input"
+
+Ce que LSP ne fait pas:
+- Comprendre le langage naturel
+- Recherche par sémantique/concept
+- Trouver du code similaire par intention
+
+Pour recherche par nom exact: utilisez LSP workspaceSymbol.
+
+Exemple:
+{
+  "query": "user authentication",
+  "results": [
+    {"name": "verify_credentials", "similarity": 0.87, "file": "auth/login.py"},
+    {"name": "check_session", "similarity": 0.72, "file": "auth/session.py"}
+  ]
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Description en langage naturel"
+                },
+                "search_type": {
+                    "type": "string",
+                    "enum": ["symbols", "files"],
+                    "default": "symbols"
+                },
+                "top_k": {"type": "integer", "default": 10, "maximum": 50},
+                "threshold": {"type": "number", "default": 0.3, "minimum": 0, "maximum": 1},
+                "kind": {"type": "string", "description": "Type de symbole"},
+                "module": {"type": "string"}
+            },
+            "required": ["query"]
+        }
+    },
+
+    # 9. find_similar_code - Trouver du code similaire
+    {
+        "name": "find_similar_code",
+        "description": """Trouve du code sémantiquement similaire à un symbole donné.
+
+QUAND L'UTILISER:
+- Refactoring: trouver du code à factoriser
+- Détecter les duplications
+- Trouver des implémentations alternatives
+
+Ce que LSP ne fait pas:
+- Comparer la sémantique du code
+- Détecter les quasi-duplications
+- Suggérer du code à factoriser
+
+Exemple:
+{
+  "symbol_id": 123,
+  "similar": [
+    {"name": "validate_user_input", "similarity": 0.89, "file": "forms/validator.py"},
+    {"name": "check_form_data", "similarity": 0.76, "file": "api/validators.py"}
+  ]
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbol_id": {
+                    "type": "integer",
+                    "description": "ID du symbole (obtenu via semantic_search)"
+                },
+                "top_k": {"type": "integer", "default": 10},
+                "threshold": {"type": "number", "default": 0.5}
+            },
+            "required": ["symbol_id"]
+        }
+    },
+
+    # =========================================================================
+    # PATTERN LEARNING (Apprentissage automatique)
+    # =========================================================================
+
+    # 10. learn_from_history - Apprendre depuis Git
+    {
+        "name": "learn_from_history",
+        "description": """Apprend des patterns d'erreurs depuis l'historique Git.
+
+QUAND L'UTILISER: Périodiquement, pour améliorer les détections.
+
+Ce que LSP ne fait pas:
+- Analyser l'historique des commits "fix"
+- Identifier les patterns d'erreurs récurrents
+- Apprendre des corrections passées
+
+Exemple:
+{
+  "commits_analyzed": 150,
+  "fixes_found": 23,
+  "patterns_learned": 5,
+  "patterns": [
+    {"name": "null_check_missing", "confidence": 0.85, "occurrences": 8}
+  ]
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "default": 90},
+                "min_fixes": {"type": "integer", "default": 2}
+            }
+        }
+    },
+
+    # 11. detect_code_smells - Détecter les anti-patterns
+    {
+        "name": "detect_code_smells",
+        "description": """Détecte les code smells et anti-patterns.
+
+QUAND L'UTILISER: Pour audit de qualité, avant refactoring.
+
+Types détectés:
+- long_method: Méthodes > 50 lignes
+- god_class: Classes > 20 méthodes
+- high_complexity: Complexité > 15
+- large_file: Fichiers > 1000 lignes
+
+Ce que LSP ne fait pas:
+- Analyse qualitative du code
+- Détection d'anti-patterns
+- Suggestions d'amélioration
+
+Exemple:
+{
+  "smells": [
+    {
+      "type": "long_method",
+      "severity": "medium",
+      "symbol": "process_request",
+      "line": 45,
+      "suggestion": "Divisez en sous-méthodes"
     }
+  ]
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Fichier (ou tous si omis)"},
+                "save_to_db": {"type": "boolean", "default": True}
+            }
+        }
+    },
+
+    # 12. get_suggestions - Suggestions d'amélioration
+    {
+        "name": "get_suggestions",
+        "description": """Suggestions d'amélioration pour un fichier.
+
+QUAND L'UTILISER: Pendant la code review, pour améliorer la qualité.
+
+Combine:
+- Patterns appris depuis l'historique
+- Code smells détectés
+- Conventions du projet
+
+Ce que LSP ne fait pas:
+- Recommandations personnalisées
+- Apprentissage continu
+- Contexte historique
+
+Exemple:
+{
+  "file_path": "src/core/engine.py",
+  "patterns": [{"name": "null_check", "confidence": 0.85}],
+  "smells": [{"type": "high_complexity", "severity": "high"}],
+  "summary": {"total": 5, "by_severity": {"high": 2, "medium": 3}}
+}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "include_patterns": {"type": "boolean", "default": True},
+                "include_smells": {"type": "boolean", "default": True}
+            },
+            "required": ["file_path"]
+        }
+    },
 ]
 
 
@@ -610,15 +555,13 @@ Exemple:
 
 class AgentDBServer:
     """
-    Serveur MCP pour AgentDB.
+    Serveur MCP v6 Lean pour AgentDB.
 
-    Implémente le Model Context Protocol pour exposer les fonctionnalités
-    d'AgentDB aux agents Claude via transport stdio.
-
-    Attributes:
-        db_path: Chemin vers la base SQLite
-        config_path: Chemin vers la configuration YAML
-        db: Instance de Database (initialisée au démarrage)
+    12 outils focalisés sur ce que LSP ne fait pas:
+    - Contexte historique (bugs, patterns, ADRs)
+    - Métriques et risque
+    - Recherche sémantique
+    - Pattern learning
     """
 
     def __init__(
@@ -626,13 +569,6 @@ class AgentDBServer:
         db_path: Optional[str] = None,
         config_path: Optional[str] = None
     ) -> None:
-        """
-        Initialise le serveur.
-
-        Args:
-            db_path: Chemin vers la base SQLite (défaut: env AGENTDB_PATH ou .claude/agentdb/db.sqlite)
-            config_path: Chemin vers la config YAML (défaut: .claude/config/agentdb.yaml)
-        """
         self.db_path = db_path or os.environ.get(
             "AGENTDB_PATH",
             ".claude/agentdb/db.sqlite"
@@ -642,34 +578,25 @@ class AgentDBServer:
             ".claude/config/agentdb.yaml"
         )
 
-        # Initialisés au démarrage
         self.db = None
         self.config = None
         self._initialized = False
-
-        # Mapping des outils vers leurs handlers
         self.tool_handlers: dict[str, Callable] = {}
 
-        logger.debug(f"AgentDBServer created with db_path={self.db_path}")
+        logger.debug(f"AgentDBServer v6 Lean created with db_path={self.db_path}")
 
     def initialize(self) -> None:
-        """
-        Initialise la connexion DB et les handlers.
-
-        Appelé automatiquement par run() ou peut être appelé manuellement.
-        """
+        """Initialise la connexion DB et les handlers."""
         if self._initialized:
             return
 
-        logger.info(f"Initializing AgentDB server...")
+        logger.info(f"Initializing AgentDB server v6 Lean...")
         logger.info(f"  Database: {self.db_path}")
-        logger.info(f"  Config: {self.config_path}")
 
         # Charger la configuration
         try:
             from agentdb.config import load_config
             self.config = load_config(self.config_path)
-            logger.info(f"  Project: {self.config.project.name}")
         except Exception as e:
             logger.warning(f"Could not load config: {e}, using defaults")
             self.config = None
@@ -684,72 +611,47 @@ class AgentDBServer:
             logger.error(f"Failed to connect to database: {e}")
             raise
 
-        # Enregistrer les handlers
+        # Enregistrer les handlers (12 outils seulement)
         self._register_handlers()
 
         self._initialized = True
-        logger.info("AgentDB server initialized successfully")
+        logger.info(f"AgentDB server v6 Lean initialized - {len(self.tool_handlers)} tools")
 
     def _register_handlers(self) -> None:
-        """Enregistre les handlers pour chaque outil."""
+        """Enregistre les 12 handlers lean."""
         self.tool_handlers = {
+            # Contexte & Historique (4 outils)
             "get_file_context": self._handle_get_file_context,
-            "get_symbol_callers": self._handle_get_symbol_callers,
-            "get_symbol_callees": self._handle_get_symbol_callees,
-            "get_file_impact": self._handle_get_file_impact,
             "get_error_history": self._handle_get_error_history,
             "get_patterns": self._handle_get_patterns,
             "get_architecture_decisions": self._handle_get_architecture_decisions,
-            "search_symbols": self._handle_search_symbols,
+            # Métriques & Risque (3 outils)
             "get_file_metrics": self._handle_get_file_metrics,
             "get_module_summary": self._handle_get_module_summary,
+            "get_risk_assessment": self._handle_get_risk_assessment,
+            # Recherche Sémantique (2 outils)
+            "semantic_search": self._handle_semantic_search,
+            "find_similar_code": self._handle_find_similar_code,
+            # Pattern Learning (3 outils)
+            "learn_from_history": self._handle_learn_from_history,
+            "detect_code_smells": self._handle_detect_code_smells,
+            "get_suggestions": self._handle_get_suggestions,
         }
 
     # =========================================================================
-    # TOOL HANDLERS
+    # HANDLERS - Contexte & Historique
     # =========================================================================
 
     async def _handle_get_file_context(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Handler pour get_file_context."""
+        """Handler pour get_file_context (simplifié, sans symboles/deps - utiliser LSP)."""
         from . import tools
         return tools.get_file_context(
             self.db,
             path=arguments["path"],
-            include_symbols=arguments.get("include_symbols", True),
-            include_dependencies=arguments.get("include_dependencies", True),
+            include_symbols=False,  # LSP documentSymbol
+            include_dependencies=False,  # LSP findReferences
             include_history=arguments.get("include_history", True),
             include_patterns=arguments.get("include_patterns", True),
-        )
-
-    async def _handle_get_symbol_callers(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Handler pour get_symbol_callers."""
-        from . import tools
-        return tools.get_symbol_callers(
-            self.db,
-            symbol_name=arguments["symbol_name"],
-            file_path=arguments.get("file_path"),
-            max_depth=arguments.get("max_depth", 3),
-            include_indirect=arguments.get("include_indirect", True),
-        )
-
-    async def _handle_get_symbol_callees(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Handler pour get_symbol_callees."""
-        from . import tools
-        return tools.get_symbol_callees(
-            self.db,
-            symbol_name=arguments["symbol_name"],
-            file_path=arguments.get("file_path"),
-            max_depth=arguments.get("max_depth", 2),
-        )
-
-    async def _handle_get_file_impact(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Handler pour get_file_impact."""
-        from . import tools
-        return tools.get_file_impact(
-            self.db,
-            path=arguments["path"],
-            include_transitive=arguments.get("include_transitive", True),
-            max_depth=arguments.get("max_depth", 3),
         )
 
     async def _handle_get_error_history(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -785,20 +687,12 @@ class AgentDBServer:
             module=arguments.get("module"),
             file_path=arguments.get("file_path"),
             status=arguments.get("status", "accepted"),
-            include_superseded=arguments.get("include_superseded", False),
+            include_superseded=False,
         )
 
-    async def _handle_search_symbols(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Handler pour search_symbols."""
-        from . import tools
-        return tools.search_symbols(
-            self.db,
-            query=arguments["query"],
-            kind=arguments.get("kind"),
-            module=arguments.get("module"),
-            file_path=arguments.get("file_path"),
-            limit=arguments.get("limit", 50),
-        )
+    # =========================================================================
+    # HANDLERS - Métriques & Risque
+    # =========================================================================
 
     async def _handle_get_file_metrics(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Handler pour get_file_metrics."""
@@ -818,20 +712,137 @@ class AgentDBServer:
             include_private=arguments.get("include_private", False),
         )
 
+    async def _handle_get_risk_assessment(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Handler pour get_risk_assessment."""
+        from . import tools_v2
+        return tools_v2.get_risk_assessment(
+            self.db,
+            file_paths=arguments["file_paths"],
+            include_recommendations=arguments.get("include_recommendations", True),
+        )
+
+    # =========================================================================
+    # HANDLERS - Recherche Sémantique
+    # =========================================================================
+
+    async def _handle_semantic_search(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Handler pour semantic_search."""
+        from agentdb.semantic import create_search_engine
+
+        engine = create_search_engine(self.db)
+        search_type = arguments.get("search_type", "symbols")
+
+        if search_type == "files":
+            return engine.search_files(
+                query=arguments["query"],
+                top_k=arguments.get("top_k", 10),
+                threshold=arguments.get("threshold", 0.3),
+                module_filter=arguments.get("module"),
+            )
+        else:
+            return engine.search_symbols(
+                query=arguments["query"],
+                top_k=arguments.get("top_k", 10),
+                threshold=arguments.get("threshold", 0.3),
+                kind_filter=arguments.get("kind"),
+                module_filter=arguments.get("module"),
+            )
+
+    async def _handle_find_similar_code(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Handler pour find_similar_code."""
+        from agentdb.semantic import create_search_engine
+
+        engine = create_search_engine(self.db)
+        similar = engine.find_similar_symbols(
+            symbol_id=arguments["symbol_id"],
+            top_k=arguments.get("top_k", 10),
+            threshold=arguments.get("threshold", 0.5),
+        )
+
+        return {
+            "symbol_id": arguments["symbol_id"],
+            "similar": similar,
+            "total": len(similar),
+        }
+
+    # =========================================================================
+    # HANDLERS - Pattern Learning
+    # =========================================================================
+
+    async def _handle_learn_from_history(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Handler pour learn_from_history."""
+        from agentdb.pattern_learner import create_pattern_learner
+
+        learner = create_pattern_learner(self.db, Path.cwd())
+        stats = learner.learn_from_git_history(
+            days=arguments.get("days", 90),
+            min_fixes=arguments.get("min_fixes", 2),
+        )
+
+        # Récupérer les patterns appris
+        patterns = self.db.fetch_all(
+            """
+            SELECT name, category, confidence_score, occurrence_count
+            FROM learned_patterns
+            WHERE is_active = 1
+            ORDER BY occurrence_count DESC
+            LIMIT 10
+            """
+        )
+
+        stats["patterns"] = [
+            {
+                "name": p["name"],
+                "category": p["category"],
+                "confidence": p["confidence_score"],
+                "occurrences": p["occurrence_count"],
+            }
+            for p in patterns
+        ]
+
+        return stats
+
+    async def _handle_detect_code_smells(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Handler pour detect_code_smells."""
+        from agentdb.pattern_learner import create_pattern_learner
+
+        learner = create_pattern_learner(self.db)
+        smells = learner.detect_code_smells(
+            file_path=arguments.get("file_path"),
+            save_to_db=arguments.get("save_to_db", True),
+        )
+
+        by_severity = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for smell in smells:
+            if smell.severity in by_severity:
+                by_severity[smell.severity] += 1
+
+        return {
+            "file_path": arguments.get("file_path", "all"),
+            "smells": [s.to_dict() for s in smells],
+            "summary": {
+                "total": len(smells),
+                "by_severity": by_severity,
+            },
+        }
+
+    async def _handle_get_suggestions(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Handler pour get_suggestions."""
+        from agentdb.pattern_learner import create_pattern_learner
+
+        learner = create_pattern_learner(self.db)
+        return learner.get_suggestions(
+            file_path=arguments["file_path"],
+            include_patterns=arguments.get("include_patterns", True),
+            include_smells=arguments.get("include_smells", True),
+        )
+
     # =========================================================================
     # MCP PROTOCOL
     # =========================================================================
 
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
-        """
-        Traite une requête JSON-RPC 2.0.
-
-        Args:
-            request: Requête JSON-RPC avec id, method, params
-
-        Returns:
-            Réponse JSON-RPC
-        """
+        """Traite une requête JSON-RPC 2.0."""
         request_id = request.get("id")
         method = request.get("method", "")
         params = request.get("params", {})
@@ -839,11 +850,10 @@ class AgentDBServer:
         logger.debug(f"Handling request: method={method}, id={request_id}")
 
         try:
-            # Dispatch selon la méthode
             if method == "initialize":
                 result = await self._handle_initialize(params)
             elif method == "initialized":
-                result = {}  # Notification, pas de réponse
+                result = {}
             elif method == "tools/list":
                 result = await self._handle_tools_list(params)
             elif method == "tools/call":
@@ -866,19 +876,16 @@ class AgentDBServer:
             "serverInfo": {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
+                "description": "AgentDB v6 Lean - Complements LSP with historical context, semantic search, and pattern learning"
             },
             "capabilities": {
-                "tools": {
-                    "listChanged": False
-                }
+                "tools": {"listChanged": False}
             }
         }
 
     async def _handle_tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle tools/list request."""
-        return {
-            "tools": TOOL_DEFINITIONS
-        }
+        return {"tools": TOOL_DEFINITIONS}
 
     async def _handle_tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle tools/call request."""
@@ -886,7 +893,7 @@ class AgentDBServer:
         arguments = params.get("arguments", {})
 
         if tool_name not in self.tool_handlers:
-            raise ValueError(f"Unknown tool: {tool_name}")
+            raise ValueError(f"Unknown tool: {tool_name}. Available: {list(self.tool_handlers.keys())}")
 
         handler = self.tool_handlers[tool_name]
         result = await handler(arguments)
@@ -907,42 +914,25 @@ class AgentDBServer:
 
     def _success_response(self, request_id: Any, result: Any) -> dict[str, Any]:
         """Build a success response."""
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": result
-        }
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
     def _error_response(self, request_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
         """Build an error response."""
-        error = {
-            "code": code,
-            "message": message
-        }
+        error = {"code": code, "message": message}
         if data is not None:
             error["data"] = data
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": error
-        }
+        return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
     # =========================================================================
     # STDIO TRANSPORT
     # =========================================================================
 
     async def run(self) -> None:
-        """
-        Lance le serveur en mode stdio.
+        """Lance le serveur en mode stdio."""
+        logger.info(f"Starting AgentDB MCP server v{SERVER_VERSION} (stdio transport)...")
 
-        Lit les requêtes JSON-RPC depuis stdin et écrit les réponses sur stdout.
-        """
-        logger.info("Starting AgentDB MCP server (stdio transport)...")
-
-        # Initialiser si pas déjà fait
         self.initialize()
 
-        # Configurer les streams
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
         await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin)
@@ -956,7 +946,6 @@ class AgentDBServer:
 
         try:
             while True:
-                # Lire une ligne (requête JSON-RPC)
                 line = await reader.readline()
                 if not line:
                     logger.info("EOF received, shutting down")
@@ -972,11 +961,10 @@ class AgentDBServer:
                     request = json.loads(line)
                     response = await self.handle_request(request)
 
-                    if response:  # Certaines notifications n'ont pas de réponse
+                    if response:
                         response_str = json.dumps(response, ensure_ascii=False) + "\n"
                         writer.write(response_str.encode("utf-8"))
                         await writer.drain()
-                        logger.debug(f"Sent: {response_str[:200]}...")
 
                 except json.JSONDecodeError as e:
                     error_response = self._error_response(None, PARSE_ERROR, f"Invalid JSON: {e}")
@@ -997,7 +985,6 @@ class AgentDBServer:
         if self.db:
             try:
                 self.db.close()
-                logger.info("Database connection closed")
             except Exception as e:
                 logger.error(f"Error closing database: {e}")
         self._initialized = False
@@ -1011,29 +998,18 @@ def main() -> None:
     """Point d'entrée du serveur MCP."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="AgentDB MCP Server")
-    parser.add_argument(
-        "--db", "-d",
-        help="Path to SQLite database",
-        default=None
-    )
-    parser.add_argument(
-        "--config", "-c",
-        help="Path to YAML config file",
-        default=None
-    )
+    parser = argparse.ArgumentParser(description="AgentDB MCP Server v6 Lean")
+    parser.add_argument("--db", "-d", help="Path to SQLite database", default=None)
+    parser.add_argument("--config", "-c", help="Path to YAML config file", default=None)
     parser.add_argument(
         "--log-level", "-l",
-        help="Logging level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO"
     )
     args = parser.parse_args()
 
-    # Configurer le logging
     logging.getLogger("agentdb").setLevel(args.log_level)
 
-    # Créer et lancer le serveur
     server = AgentDBServer(db_path=args.db, config_path=args.config)
     asyncio.run(server.run())
 

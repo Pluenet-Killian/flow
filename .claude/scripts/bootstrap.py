@@ -2,16 +2,18 @@
 """
 AgentDB Bootstrap Script - Initialisation de la base de données.
 
-Ce script exécute les 9 étapes du bootstrap :
+Ce script exécute les 11 étapes du bootstrap :
 1. Créer la structure (dossiers)
 2. Initialiser le schéma SQL
 3. Scanner les fichiers
-4. Indexer les symboles et relations
+4. Indexer les symboles et relations (multi-langage avec tree-sitter)
 5. Calculer les métriques
 6. Analyser l'activité Git
 7. Marquer les fichiers critiques
 8. Importer les patterns par défaut
 9. Vérifier l'intégrité
+10. Indexation sémantique (embeddings vectoriels)
+11. Détection de code smells et pattern learning
 
 Usage:
     python -m scripts.bootstrap [--project-root PATH]
@@ -33,8 +35,10 @@ import subprocess
 import sys
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from multiprocessing import cpu_count
 from pathlib import Path
 from typing import Any, Optional
 
@@ -91,7 +95,7 @@ class BootstrapConfig:
         "*.o", "*.obj", "*.exe", "*.dll", "*.so", "*.a", "*.lib",
         # Dependencies
         "third_party/**", "external/**", "deps/**",
-        "vendor/**", "node_modules/**", ".venv/**", "venv/**",
+        "vendor/**", "node_modules/**", ".venv/**", ".venv-*/**", "venv/**",
         # Caches
         ".cache/**", ".direnv/**", ".ccache/**",
         "__pycache__/**", "*.pyc", "*.egg-info/**",
@@ -239,7 +243,7 @@ def setup_logging(logs_dir: Path) -> logging.Logger:
 
 def step_1_create_structure(config: BootstrapConfig, logger: logging.Logger) -> bool:
     """Étape 1 : Créer la structure de dossiers."""
-    print(f"\n{Colors.BOLD}Step 1/9:{Colors.RESET} Creating directory structure...")
+    print(f"\n{Colors.BOLD}Step 1/11:{Colors.RESET} Creating directory structure...")
 
     directories = [
         config.agentdb_dir,
@@ -276,7 +280,7 @@ def step_1_create_structure(config: BootstrapConfig, logger: logging.Logger) -> 
 
 def step_2_init_schema(config: BootstrapConfig, logger: logging.Logger) -> bool:
     """Étape 2 : Initialiser le schéma SQL."""
-    print(f"\n{Colors.BOLD}Step 2/9:{Colors.RESET} Initializing database schema...")
+    print(f"\n{Colors.BOLD}Step 2/11:{Colors.RESET} Initializing database schema...")
 
     # Vérifier que le schéma existe
     if not config.schema_path.exists():
@@ -337,7 +341,11 @@ def should_exclude(path: str, patterns: list[str]) -> bool:
         # Pattern "dir/**" : exclure tout le dossier
         if pattern.endswith("/**"):
             prefix = pattern[:-3]
-            if path.startswith(prefix + "/") or path == prefix:
+            # Si le préfixe contient des wildcards, utiliser fnmatch sur le premier composant
+            if "*" in prefix or "?" in prefix:
+                if path_parts and fnmatch.fnmatch(path_parts[0], prefix):
+                    return True
+            elif path.startswith(prefix + "/") or path == prefix:
                 return True
             continue
 
@@ -430,7 +438,7 @@ def step_3_scan_files(
     stats: BootstrapStats
 ) -> list[dict[str, Any]]:
     """Étape 3 : Scanner les fichiers du projet."""
-    print(f"\n{Colors.BOLD}Step 3/9:{Colors.RESET} Scanning files...")
+    print(f"\n{Colors.BOLD}Step 3/11:{Colors.RESET} Scanning files...")
 
     # Collecter toutes les extensions valides
     valid_extensions = set()
@@ -742,53 +750,131 @@ def extract_includes(file_path: Path, language: str) -> list[dict[str, str]]:
     return includes
 
 
+# Worker function pour parsing parallèle (doit être au niveau module pour pickle)
+def _parse_file_worker(args: tuple) -> dict[str, Any]:
+    """
+    Worker pour parser un fichier en parallèle.
+    Retourne les symboles et imports extraits.
+    """
+    file_info, agentdb_path_str, ctags_available = args
+    file_id = file_info["id"]
+    file_path = file_info["full_path"]
+    language = file_info.get("language", "")
+
+    result = {
+        "file_id": file_id,
+        "symbols": [],
+        "includes": [],
+        "error": None,
+    }
+
+    # Importer tree-sitter dans le worker
+    try:
+        import sys
+        if agentdb_path_str not in sys.path:
+            sys.path.insert(0, agentdb_path_str)
+        from tree_sitter_parser import TreeSitterParser, is_tree_sitter_available
+
+        if is_tree_sitter_available():
+            ts_parser = TreeSitterParser()
+            parse_result = ts_parser.parse_file(file_path)
+            if parse_result.symbols:
+                result["symbols"] = [s.to_dict() for s in parse_result.symbols]
+    except Exception as e:
+        result["error"] = str(e)
+
+    # Fallback sur parsers natifs si pas de symboles
+    if not result["symbols"]:
+        try:
+            if language == "python":
+                result["symbols"] = parse_python_file(file_path)
+            elif ctags_available and language in ("c", "cpp"):
+                result["symbols"] = run_ctags(file_path)
+        except Exception as e:
+            result["error"] = str(e)
+
+    # Extraire les imports
+    try:
+        result["includes"] = extract_includes(file_path, language)
+    except Exception:
+        pass
+
+    return result
+
+
 def step_4_index_symbols(
     config: BootstrapConfig,
     logger: logging.Logger,
     stats: BootstrapStats,
     files: list[dict[str, Any]]
 ) -> None:
-    """Étape 4 : Indexer les symboles et relations."""
-    print(f"\n{Colors.BOLD}Step 4/9:{Colors.RESET} Indexing symbols and relations...")
+    """Étape 4 : Indexer les symboles et relations (OPTIMISÉ avec parallélisation)."""
+    print(f"\n{Colors.BOLD}Step 4/11:{Colors.RESET} Indexing symbols and relations...")
 
-    # Vérifier si ctags est disponible
+    # Vérifier les parsers disponibles
+    tree_sitter_available = False
+    try:
+        import sys
+        agentdb_path = config.project_root / ".claude" / "agentdb"
+        if str(agentdb_path) not in sys.path:
+            sys.path.insert(0, str(agentdb_path))
+        from tree_sitter_parser import is_tree_sitter_available
+        tree_sitter_available = is_tree_sitter_available()
+        if tree_sitter_available:
+            print(f"  {Colors.GREEN}✓{Colors.RESET} tree-sitter available (multi-language support)")
+    except ImportError:
+        logger.warning("tree-sitter module not available")
+
     ctags_available = shutil.which("ctags") is not None
-    if not ctags_available:
-        logger.warning("ctags not found, using fallback parsing")
-        stats.warnings.append("ctags not found, using limited parsing")
+    if not tree_sitter_available and not ctags_available:
+        logger.warning("No parser available (tree-sitter or ctags), using limited parsing")
+        stats.warnings.append("Limited parsing: install tree-sitter-languages for full support")
 
+    # Nombre de workers (laisser 1-2 cores libres pour le système)
+    num_workers = max(1, cpu_count() - 2)
+    print(f"  {Colors.CYAN}→{Colors.RESET} Using {num_workers} parallel workers")
+
+    agentdb_path_str = str(config.project_root / ".claude" / "agentdb")
+
+    # Préparer les arguments pour les workers
+    worker_args = [
+        (file_info, agentdb_path_str, ctags_available)
+        for file_info in files
+    ]
+
+    # Phase 1: Parsing parallèle
+    print(f"  {Colors.CYAN}→{Colors.RESET} Phase 1: Parsing files in parallel...")
+    all_results = []
+    progress = ProgressBar(len(files), "Parsing")
+
+    # Utiliser ProcessPoolExecutor pour le parsing parallèle
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(_parse_file_worker, args): args[0]["id"]
+                   for args in worker_args}
+
+        for future in as_completed(futures):
+            progress.update()
+            try:
+                result = future.result()
+                all_results.append(result)
+            except Exception as e:
+                logger.debug(f"Worker error: {e}")
+
+    progress.finish()
+
+    # Phase 2: Insertion batch en SQLite
+    print(f"  {Colors.CYAN}→{Colors.RESET} Phase 2: Batch inserting to database...")
     conn = sqlite3.connect(str(config.db_path))
     cursor = conn.cursor()
 
-    progress = ProgressBar(len(files), "Indexing")
-
-    # Index de tous les symboles pour les relations
+    # Collecter tous les symboles pour insertion batch
+    symbols_batch = []
     all_symbols: dict[str, int] = {}
 
-    for file_info in files:
-        progress.update()
-
-        file_id = file_info["id"]
-        file_path = file_info["full_path"]
-        language = file_info.get("language", "")
-
-        # Parser les symboles
-        if language == "python":
-            symbols = parse_python_file(file_path)
-        elif ctags_available and language in ("c", "cpp"):
-            symbols = run_ctags(file_path)
-        else:
-            symbols = []
-
-        # Insérer les symboles avec tous les champs
-        for sym in symbols:
-            cursor.execute("""
-                INSERT INTO symbols (
-                    file_id, name, qualified_name, kind, line_start, line_end,
-                    signature, visibility, complexity, is_static,
-                    doc_comment, has_doc, base_classes_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
+    for result in all_results:
+        file_id = result["file_id"]
+        for sym in result["symbols"]:
+            symbols_batch.append((
                 file_id,
                 sym.get("name", ""),
                 sym.get("qualified_name"),
@@ -804,34 +890,55 @@ def step_4_index_symbols(
                 json.dumps(sym.get("base_classes")) if sym.get("base_classes") else None,
             ))
 
-            sym_id = cursor.lastrowid
-            stats.symbols_indexed += 1
+    # Insertion batch des symboles (OR IGNORE pour gérer les doublons)
+    if symbols_batch:
+        cursor.executemany("""
+            INSERT OR IGNORE INTO symbols (
+                file_id, name, qualified_name, kind, line_start, line_end,
+                signature, visibility, complexity, is_static,
+                doc_comment, has_doc, base_classes_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, symbols_batch)
+        # Compter les symboles réellement insérés
+        cursor.execute("SELECT COUNT(*) FROM symbols")
+        stats.symbols_indexed = cursor.fetchone()[0]
 
-            # Indexer pour les relations
-            all_symbols[sym.get("name", "")] = sym_id
+    # Récupérer les IDs des symboles insérés pour les relations
+    cursor.execute("SELECT id, name FROM symbols")
+    for sym_id, sym_name in cursor.fetchall():
+        all_symbols[sym_name] = sym_id
 
-        # Extraire les includes/imports
-        includes = extract_includes(file_path, language)
-        for inc in includes:
-            # Chercher le fichier cible
-            target_pattern = f"%{inc['target']}%"
-            cursor.execute(
-                "SELECT id FROM files WHERE path LIKE ?",
-                (target_pattern,)
-            )
-            target = cursor.fetchone()
+    # Collecter et insérer les relations de fichiers
+    file_relations_batch = []
 
-            if target:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO file_relations (
-                        source_file_id, target_file_id, relation_type, line_number
-                    ) VALUES (?, ?, 'includes', ?)
-                """, (file_id, target[0], inc["line"]))
-                stats.file_relations_indexed += 1
+    # Créer un index des fichiers par path pattern
+    cursor.execute("SELECT id, path FROM files")
+    file_index = {row[1]: row[0] for row in cursor.fetchall()}
 
-        logger.debug(f"Indexed {len(symbols)} symbols from {file_info['path']}")
+    for result in all_results:
+        file_id = result["file_id"]
+        for inc in result.get("includes", []):
+            target_name = inc.get("target", "")
+            # Chercher le fichier cible dans l'index
+            for path, target_id in file_index.items():
+                if target_name in path:
+                    file_relations_batch.append((
+                        file_id,
+                        target_id,
+                        "includes",
+                        inc.get("line", 0),
+                    ))
+                    break
 
-    progress.finish()
+    # Insertion batch des relations
+    if file_relations_batch:
+        cursor.executemany("""
+            INSERT OR IGNORE INTO file_relations (
+                source_file_id, target_file_id, relation_type, line_number
+            ) VALUES (?, ?, ?, ?)
+        """, file_relations_batch)
+        stats.file_relations_indexed = len(file_relations_batch)
+
     conn.commit()
     conn.close()
 
@@ -1151,7 +1258,7 @@ def step_5_calculate_metrics(
     files: list[dict[str, Any]]
 ) -> None:
     """Étape 5 : Calculer les métriques."""
-    print(f"\n{Colors.BOLD}Step 5/9:{Colors.RESET} Calculating metrics...")
+    print(f"\n{Colors.BOLD}Step 5/11:{Colors.RESET} Calculating metrics...")
 
     conn = sqlite3.connect(str(config.db_path))
     cursor = conn.cursor()
@@ -1261,7 +1368,7 @@ def step_6_analyze_git(
     files: list[dict[str, Any]]
 ) -> None:
     """Étape 6 : Analyser l'activité Git."""
-    print(f"\n{Colors.BOLD}Step 6/9:{Colors.RESET} Analyzing Git activity...")
+    print(f"\n{Colors.BOLD}Step 6/11:{Colors.RESET} Analyzing Git activity...")
 
     # Vérifier si on est dans un repo git
     if not (config.project_root / ".git").exists():
@@ -1376,7 +1483,7 @@ def step_7_mark_critical(
     files: list[dict[str, Any]]
 ) -> None:
     """Étape 7 : Marquer les fichiers critiques."""
-    print(f"\n{Colors.BOLD}Step 7/9:{Colors.RESET} Marking critical files...")
+    print(f"\n{Colors.BOLD}Step 7/11:{Colors.RESET} Marking critical files...")
 
     conn = sqlite3.connect(str(config.db_path))
     cursor = conn.cursor()
@@ -1696,7 +1803,7 @@ def step_8_import_patterns(
     stats: BootstrapStats
 ) -> None:
     """Étape 8 : Importer les patterns par défaut."""
-    print(f"\n{Colors.BOLD}Step 8/9:{Colors.RESET} Importing default patterns...")
+    print(f"\n{Colors.BOLD}Step 8/11:{Colors.RESET} Importing default patterns...")
 
     conn = sqlite3.connect(str(config.db_path))
     cursor = conn.cursor()
@@ -1742,7 +1849,7 @@ def step_9_verify_integrity(
     stats: BootstrapStats
 ) -> bool:
     """Étape 9 : Vérifier l'intégrité de la base."""
-    print(f"\n{Colors.BOLD}Step 9/9:{Colors.RESET} Verifying database integrity...")
+    print(f"\n{Colors.BOLD}Step 9/11:{Colors.RESET} Verifying database integrity...")
 
     conn = sqlite3.connect(str(config.db_path))
     cursor = conn.cursor()
@@ -1818,6 +1925,243 @@ def step_9_verify_integrity(
     print(f"    Query time: {query_time:.1f}ms")
 
     return True
+
+
+def step_10_semantic_indexing(
+    config: BootstrapConfig,
+    logger: logging.Logger,
+    stats: BootstrapStats,
+    force: bool = False
+) -> bool:
+    """Étape 10 : Indexation sémantique (embeddings).
+
+    Génère des embeddings vectoriels pour les symboles afin de permettre
+    la recherche sémantique par langage naturel.
+
+    Nécessite: pip install sentence-transformers
+    """
+    print(f"\n{Colors.BOLD}Step 10/11:{Colors.RESET} Semantic indexing (embeddings)...")
+
+    # Vérifier si sentence-transformers est disponible
+    try:
+        # Ajouter le path pour les imports
+        import sys
+        agentdb_path = config.project_root / ".claude" / "agentdb"
+        if str(agentdb_path) not in sys.path:
+            sys.path.insert(0, str(agentdb_path))
+
+        from semantic import SemanticIndexer, EmbeddingModel, is_semantic_available
+
+        if not is_semantic_available():
+            print(f"  {Colors.YELLOW}⚠{Colors.RESET} sentence-transformers not installed")
+            print(f"    Install with: pip install sentence-transformers")
+            print(f"    Skipping semantic indexing...")
+            stats.warnings.append("Semantic indexing skipped (sentence-transformers not installed)")
+            return True  # Not a failure, just skipped
+
+    except ImportError as e:
+        logger.warning(f"Could not import semantic module: {e}")
+        print(f"  {Colors.YELLOW}⚠{Colors.RESET} Semantic module not available: {e}")
+        stats.warnings.append(f"Semantic indexing skipped: {e}")
+        return True
+
+    # Créer une connexion DB simple pour l'indexeur
+    class SimpleDB:
+        """Wrapper simple pour la connexion SQLite."""
+        def __init__(self, db_path):
+            self.conn = sqlite3.connect(str(db_path))
+            self.conn.row_factory = sqlite3.Row
+
+        def execute(self, query, params=()):
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            self.conn.commit()
+            return cursor
+
+        def fetch_one(self, query, params=()):
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+        def fetch_all(self, query, params=()):
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+        def close(self):
+            self.conn.close()
+
+    db = None
+    try:
+        db = SimpleDB(config.db_path)
+        indexer = SemanticIndexer(db)
+
+        # Créer les tables si nécessaire
+        print(f"  Creating embedding tables...")
+        schema_path = config.project_root / ".claude" / "agentdb" / "schema.sql"
+        if schema_path.exists():
+            # Lire et exécuter uniquement la partie PILIER 7
+            with open(schema_path) as f:
+                schema = f.read()
+                # Extraire le pilier 7 (embeddings)
+                if "PILIER 7" in schema:
+                    start = schema.find("-- PILIER 7")
+                    if start != -1:
+                        pilier7 = schema[start:]
+                        try:
+                            db.conn.executescript(pilier7)
+                        except sqlite3.OperationalError:
+                            pass  # Tables already exist
+
+        # Indexer les symboles
+        print(f"  Indexing symbol embeddings...")
+        result = indexer.index_symbols(force_reindex=force, show_progress=True)
+
+        indexed = result.get("indexed", 0)
+        skipped = result.get("skipped", 0)
+        errors = result.get("errors", 0)
+
+        if "error" in result:
+            print(f"  {Colors.YELLOW}⚠{Colors.RESET} {result['error']}")
+            stats.warnings.append(f"Semantic indexing: {result['error']}")
+        else:
+            print(f"  {Colors.GREEN}✓{Colors.RESET} Symbol embeddings: {indexed} indexed, {skipped} skipped, {errors} errors")
+
+        # Indexer les fichiers (optionnel, plus rapide)
+        print(f"  Indexing file embeddings...")
+        file_result = indexer.index_files(force_reindex=force, show_progress=True)
+        file_indexed = file_result.get("indexed", 0)
+        file_skipped = file_result.get("skipped", 0)
+        print(f"  {Colors.GREEN}✓{Colors.RESET} File embeddings: {file_indexed} indexed, {file_skipped} skipped")
+
+        # Stats
+        stats_info = indexer.get_stats()
+        if stats_info:
+            for type_name, type_stats in stats_info.items():
+                coverage = type_stats.get("coverage_percent", 0)
+                if coverage < 50:
+                    stats.warnings.append(f"Low semantic coverage for {type_name}: {coverage}%")
+
+        return True
+
+    except Exception as e:
+        logger.exception("Semantic indexing failed")
+        print(f"  {Colors.RED}✗{Colors.RESET} Semantic indexing failed: {e}")
+        stats.errors.append(f"Semantic indexing: {e}")
+        return False
+    finally:
+        if db:
+            db.close()
+
+
+def step_11_detect_smells(
+    config: BootstrapConfig,
+    logger: logging.Logger,
+    stats: BootstrapStats
+) -> bool:
+    """Étape 11 : Détection des code smells et apprentissage.
+
+    Analyse le code pour détecter les anti-patterns courants et
+    apprend des patterns à partir de l'historique Git.
+    """
+    print(f"\n{Colors.BOLD}Step 11/11:{Colors.RESET} Detecting code smells and learning patterns...")
+
+    # Wrapper DB simple
+    class SimpleDB:
+        def __init__(self, db_path):
+            self.conn = sqlite3.connect(str(db_path))
+            self.conn.row_factory = sqlite3.Row
+
+        def execute(self, query, params=()):
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            self.conn.commit()
+            return cursor
+
+        def fetch_one(self, query, params=()):
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+        def fetch_all(self, query, params=()):
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+        def close(self):
+            self.conn.close()
+
+    db = None
+    try:
+        # Importer le module
+        import sys
+        agentdb_path = config.project_root / ".claude" / "agentdb"
+        if str(agentdb_path) not in sys.path:
+            sys.path.insert(0, str(agentdb_path))
+
+        from pattern_learner import PatternLearner
+
+        db = SimpleDB(config.db_path)
+
+        # Créer les tables si nécessaire
+        schema_path = config.project_root / ".claude" / "agentdb" / "schema.sql"
+        if schema_path.exists():
+            with open(schema_path) as f:
+                schema = f.read()
+                if "PILIER 8" in schema:
+                    start = schema.find("-- PILIER 8")
+                    if start != -1:
+                        pilier8 = schema[start:]
+                        try:
+                            db.conn.executescript(pilier8)
+                        except sqlite3.OperationalError:
+                            pass  # Tables already exist
+
+        learner = PatternLearner(db, config.project_root)
+
+        # 1. Apprendre des patterns depuis l'historique Git
+        print(f"  Learning from Git history...")
+        learn_stats = learner.learn_from_git_history(days=90, min_fixes=2)
+        print(f"  {Colors.GREEN}✓{Colors.RESET} Analyzed {learn_stats.get('commits_analyzed', 0)} commits, "
+              f"found {learn_stats.get('fixes_found', 0)} fixes, "
+              f"learned {learn_stats.get('patterns_learned', 0)} patterns")
+
+        # 2. Détecter les code smells
+        print(f"  Detecting code smells...")
+        smells = learner.detect_code_smells(save_to_db=True)
+
+        # Grouper par sévérité
+        by_severity = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for smell in smells:
+            sev = smell.severity
+            if sev in by_severity:
+                by_severity[sev] += 1
+
+        print(f"  {Colors.GREEN}✓{Colors.RESET} Detected {len(smells)} code smells "
+              f"(critical: {by_severity['critical']}, high: {by_severity['high']}, "
+              f"medium: {by_severity['medium']})")
+
+        if by_severity['critical'] > 0:
+            stats.warnings.append(f"{by_severity['critical']} critical code smells detected")
+
+        return True
+
+    except ImportError as e:
+        logger.warning(f"Pattern learner module not available: {e}")
+        print(f"  {Colors.YELLOW}⚠{Colors.RESET} Pattern learning skipped (module not available)")
+        return True
+
+    except Exception as e:
+        logger.exception("Code smell detection failed")
+        print(f"  {Colors.RED}✗{Colors.RESET} Code smell detection failed: {e}")
+        stats.errors.append(f"Code smell detection: {e}")
+        return False
+
+    finally:
+        if db:
+            db.close()
 
 
 # =============================================================================
@@ -2229,9 +2573,10 @@ def run_incremental(
     stats = BootstrapStats()
     stats.start_time = time.time()
 
-    print(f"\n{Colors.BOLD}{Colors.CYAN}Incremental Indexation{Colors.RESET}")
+    print(f"\n{Colors.BOLD}{Colors.CYAN}[AgentDB] Incremental Indexation{Colors.RESET}")
     print(f"{'=' * 60}")
-    print(f"Checkpoint: {checkpoint.last_commit_short} ({checkpoint.last_indexed_at})")
+    print(f"[AgentDB] Last indexed: {checkpoint.last_commit_short} ({checkpoint.last_indexed_at})")
+    print(f"[AgentDB] Note: This is the symbol database update, not the code analysis scope")
 
     # Récupérer les fichiers modifiés
     changes = get_changed_files(config, checkpoint)
@@ -2243,7 +2588,7 @@ def run_incremental(
     )
 
     if total_changes == 0:
-        print(f"\n{Colors.GREEN}✓{Colors.RESET} Base already up to date")
+        print(f"\n{Colors.GREEN}✓{Colors.RESET} [AgentDB] Symbol database already up to date")
         print(f"  Last indexed: {checkpoint.last_commit_short}")
         stats.end_time = time.time()
         return True, stats
@@ -2254,7 +2599,7 @@ def run_incremental(
         print(f"  (Consider using --full if you did a major rebase)")
 
     # Afficher le résumé des changements
-    print(f"\n{Colors.BOLD}Changes detected:{Colors.RESET}")
+    print(f"\n{Colors.BOLD}[AgentDB] Files to re-index:{Colors.RESET}")
     if changes["modified"]:
         print(f"  Modified: {len(changes['modified'])} files")
     if changes["added"]:
@@ -2468,6 +2813,28 @@ def main() -> int:
         action="store_true",
         help="Force full indexation even if checkpoint exists"
     )
+    parser.add_argument(
+        "--semantic",
+        action="store_true",
+        default=True,
+        help="Enable semantic indexing (embeddings). Enabled by default."
+    )
+    parser.add_argument(
+        "--no-semantic",
+        action="store_true",
+        help="Disable semantic indexing"
+    )
+    parser.add_argument(
+        "--learning",
+        action="store_true",
+        default=True,
+        help="Enable pattern learning and code smell detection. Enabled by default."
+    )
+    parser.add_argument(
+        "--no-learning",
+        action="store_true",
+        help="Disable pattern learning and code smell detection"
+    )
 
     args = parser.parse_args()
 
@@ -2571,6 +2938,16 @@ def main() -> int:
         if success:
             if not step_9_verify_integrity(config, logger, stats):
                 success = False
+
+        # Step 10: Semantic indexing (optional)
+        if success and args.semantic and not args.no_semantic:
+            step_10_semantic_indexing(config, logger, stats, force=args.force)
+            # Note: semantic indexing failure is not fatal
+
+        # Step 11: Pattern learning and code smell detection (optional)
+        if success and args.learning and not args.no_learning:
+            step_11_detect_smells(config, logger, stats)
+            # Note: pattern learning failure is not fatal
 
     except KeyboardInterrupt:
         print(f"\n\n{Colors.YELLOW}Bootstrap interrupted by user{Colors.RESET}")

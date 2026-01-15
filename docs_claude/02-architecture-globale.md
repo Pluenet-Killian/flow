@@ -434,6 +434,100 @@ PRAGMA temp_store = MEMORY;    -- Temp tables en RAM
 
 ---
 
+## Flux d'Analyse Multi-Agents (8 agents en 4 phases)
+
+```mermaid
+flowchart TB
+    subgraph PHASE0["Phase 0: Initialisation"]
+        INIT["Nettoyer logs<br/>+ AgentDB bootstrap"]
+    end
+
+    subgraph PHASE1["Phase 1: Analyse Parallele (3 agents)"]
+        direction LR
+        ANA["ANALYZER<br/>(impact)"]
+        SEC["SECURITY<br/>(failles)"]
+        REV["REVIEWER<br/>(qualite)"]
+    end
+
+    subgraph PHASE2["Phase 2: RISK puis Enrichissement"]
+        RISK["RISK<br/>(attend Phase 1)"]
+        direction LR
+        SYN["SYNTHESIS<br/>(fusion 4 agents)"]
+        SON["SONAR<br/>(issues SonarQube)"]
+    end
+
+    subgraph PHASE3["Phase 3: Consolidation"]
+        META["META-SYNTHESIS<br/>(fusion + dedup)"]
+    end
+
+    subgraph PHASE4["Phase 4: Publication"]
+        WEB["WEB-SYNTHESIZER<br/>(JSON site)"]
+    end
+
+    INIT --> PHASE1
+    ANA & SEC & REV --> RISK
+    RISK --> SYN & SON
+    SYN & SON --> META
+    META --> WEB
+
+    %% Styles
+    classDef phase1 fill:#3b82f6,stroke:#1d4ed8,color:white
+    classDef phase2a fill:#7c3aed,stroke:#5b21b6,color:white
+    classDef phase2b fill:#8b5cf6,stroke:#6d28d9,color:white
+    classDef phase3 fill:#f59e0b,stroke:#d97706,color:white
+    classDef phase4 fill:#10b981,stroke:#059669,color:white
+
+    class ANA,SEC,REV phase1
+    class RISK phase2a
+    class SYN,SON phase2b
+    class META phase3
+    class WEB phase4
+```
+
+### Donnees Produites par Phase
+
+| Phase | Agents | Output |
+|-------|--------|--------|
+| 1 | analyzer, security, reviewer (parallele) | 3 rapports individuels (`.md` + JSON) |
+| 2 | risk (sequentiel) | `risk.md` + JSON |
+| 2 | synthesis + sonar (parallele) | `REPORT.md` + `sonar-enriched.json` |
+| 3 | meta-synthesis | `meta-synthesis.json` |
+| 4 | web-synthesizer | `web-report-{date}-{commit}.json` |
+
+---
+
+## Support Multi-Branche
+
+AgentDB supporte l'analyse parallele de plusieurs branches grace a une architecture hybride :
+
+```
+/tmp/cre-agentdb-cache/
+├── branches/
+│   ├── main/
+│   │   ├── current.sqlite      # Index courant
+│   │   ├── checkpoint.json     # {"commit": "...", "timestamp": ...}
+│   │   └── snapshots/
+│   │       └── abc123.sqlite   # Snapshots historiques
+│   └── feature-auth/
+│       └── ...
+```
+
+### Composants
+
+| Fichier | Role |
+|---------|------|
+| `agentdb_manager.py` | Gestionnaire de caches par branche |
+| `worktree.py` | Gestionnaire git worktrees pour analyses paralleles |
+| `shared.sqlite` | Base partagee (checkpoints, historique) |
+
+### Strategie
+
+- **`shared.sqlite`** : Symlink vers repo principal (checkpoints, historique des erreurs)
+- **`index.sqlite`** : Cache par branche avec incrementalite
+- **`snapshots/`** : Pour retour arriere ou branches divergentes
+
+---
+
 ## Prochaine Etape
 
 Continuez vers [03-analyse-configuration.md](./03-analyse-configuration.md) pour une dissection complete des fichiers de configuration.

@@ -304,6 +304,79 @@ chmod +x .git/hooks/post-commit
 
 ---
 
+## Etape 5.5 : Lancer une Analyse Complete avec /analyze
+
+### La Commande /analyze
+
+La commande `/analyze` orchestre les 8 agents en 4 phases :
+
+```bash
+# Depuis Claude Code
+/analyze
+```
+
+### Variables de Contexte Git
+
+Le script `main.py` calcule automatiquement le contexte Git :
+
+| Variable | Description | Exemple |
+|----------|-------------|---------|
+| `$BRANCH_NAME` | Branche actuelle | `feature/auth` |
+| `$PARENT_BRANCH` | Branche parente | `main` |
+| `$FROM_COMMIT` | Base du diff (merge-base) | `abc123` |
+| `$TO_COMMIT` | HEAD | `def456` |
+| `$FILES_LIST` | Fichiers modifies | `src/auth.py, src/login.py` |
+| `$FILES_COUNT` | Nombre de fichiers | `2` |
+
+### Deroulement de l'Analyse
+
+```
+Phase 0: Initialisation
+  ├─ Nettoyer logs (.claude/logs/agentdb_queries.log)
+  └─ AgentDB bootstrap --incremental
+
+Phase 1: Analyse Parallele (3 agents)
+  ├─ ANALYZER : Impact des modifications
+  ├─ SECURITY : Vulnerabilites et CWEs
+  └─ REVIEWER : Qualite et conventions
+
+Phase 2: RISK puis Enrichissement
+  ├─ RISK : Score de risque (attend Phase 1)
+  │
+  └─ Puis en parallele :
+      ├─ SYNTHESIS : Fusionne les 4 agents
+      └─ SONAR : Enrichit SonarQube (si disponible)
+
+Phase 3: Consolidation
+  └─ META-SYNTHESIS : Fusion + deduplication
+
+Phase 4: Publication
+  └─ WEB-SYNTHESIZER : JSON pour site web
+
+Resultat : .claude/reports/{date}-{commit}/
+  ├─ REPORT.md
+  ├─ analyzer.md, security.md, reviewer.md, risk.md
+  ├─ meta-synthesis.json
+  └─ web-report.json
+```
+
+### Exemple de Sortie
+
+```
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║     VERDICT: 🟠 CAREFUL - Review approfondie requise          ║
+║                                                               ║
+║     SCORE GLOBAL: 62/100                                      ║
+║                                                               ║
+║     3 issues bloquantes detectees                             ║
+║     Temps de correction estime : ~45 minutes                  ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+```
+
+---
+
 ## Etape 6 : Cas d'Usage Avance
 
 ### 6.1 Analyse d'Impact Avant Refactoring
@@ -476,9 +549,26 @@ graph TD
     D --> E{Modification code?}
     E -->|Oui| F[5. git commit]
     F --> G[6. Update incrementale]
-    G --> D
+    G --> H{Analyse complete?}
+    H -->|Oui| I["/analyze<br/>(8 agents)"]
+    I --> J["Rapport dans<br/>.claude/reports/"]
+    J --> D
+    H -->|Non| D
     E -->|Non| D
 ```
+
+### Les 8 Agents et leurs Roles
+
+| Phase | Agent | Role |
+|-------|-------|------|
+| 1 | analyzer | Calcule l'impact des modifications |
+| 1 | security | Detecte les vulnerabilites (CWEs) |
+| 1 | reviewer | Verifie qualite et conventions |
+| 1 | risk | Score de risque global |
+| 2 | synthesis | Fusionne les 4 agents Phase 1 |
+| 2 | sonar | Enrichit les issues SonarQube |
+| 3 | meta-synthesis | Consolidation et deduplication |
+| 4 | web-synthesizer | JSON pour site web CRE |
 
 ---
 

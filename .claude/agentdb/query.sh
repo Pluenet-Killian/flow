@@ -250,6 +250,9 @@ cmd_file_context() {
         return 1
     fi
 
+    # Échappement SQL pour prévenir les injections
+    local safe_path=$(sql_escape "$path")
+
     # Info fichier
     local file_info=$(sqlite_json_one "
         SELECT
@@ -259,7 +262,7 @@ cmd_file_context() {
             complexity_avg, complexity_max,
             commits_30d, commits_90d, last_modified
         FROM files
-        WHERE path = '$path'
+        WHERE path = '$safe_path'
     ")
 
     if [[ "$file_info" == "{}" ]]; then
@@ -302,7 +305,7 @@ cmd_file_context() {
     local errors=$(sqlite_json "
         SELECT error_type, severity, title, resolved_at, resolution
         FROM error_history
-        WHERE file_path = '$path' OR file_id = $file_id
+        WHERE file_path = '$safe_path' OR file_id = $file_id
         ORDER BY discovered_at DESC
         LIMIT 5
     ")
@@ -312,7 +315,7 @@ cmd_file_context() {
         SELECT name, title, description
         FROM patterns
         WHERE is_active = 1
-        AND (file_pattern IS NULL OR '$path' GLOB file_pattern)
+        AND (file_pattern IS NULL OR '$safe_path' GLOB file_pattern)
     ")
 
     # Construire le JSON final
@@ -361,6 +364,9 @@ cmd_file_metrics() {
         return 1
     fi
 
+    # Échappement SQL pour prévenir les injections
+    local safe_path=$(sql_escape "$path")
+
     local file_info=$(sqlite_json_one "
         SELECT
             f.*,
@@ -369,7 +375,7 @@ cmd_file_metrics() {
             (SELECT COUNT(*) FROM symbols WHERE file_id = f.id AND kind = 'macro') as macro_count,
             (SELECT COUNT(*) FROM symbols WHERE file_id = f.id AND kind IN ('variable', 'constant')) as var_count
         FROM files f
-        WHERE f.path = '$path'
+        WHERE f.path = '$safe_path'
     ")
 
     if [[ "$file_info" == "{}" ]]; then
@@ -422,7 +428,10 @@ cmd_file_impact() {
         return 1
     fi
 
-    local file_id=$(sqlite_json_one "SELECT id FROM files WHERE path = '$path'" | jq -r '.id')
+    # Échappement SQL pour prévenir les injections
+    local safe_path=$(sql_escape "$path")
+
+    local file_id=$(sqlite_json_one "SELECT id FROM files WHERE path = '$safe_path'" | jq -r '.id')
 
     if [[ -z "$file_id" || "$file_id" == "null" ]]; then
         echo '{"error": "File not found: '"$path"'"}'
@@ -484,9 +493,13 @@ cmd_symbol_callers() {
         return 1
     fi
 
+    # Échappement SQL pour prévenir les injections
+    local safe_symbol_name=$(sql_escape "$symbol_name")
+    local safe_file_path=$(sql_escape "$file_path")
+
     local file_filter=""
     if [[ -n "$file_path" ]]; then
-        file_filter="AND f.path = '$file_path'"
+        file_filter="AND f.path = '$safe_file_path'"
     fi
 
     # Trouver le symbole cible
@@ -494,7 +507,7 @@ cmd_symbol_callers() {
         SELECT s.id, s.name, s.kind, f.path as file
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE s.name = '$symbol_name'
+        WHERE s.name = '$safe_symbol_name'
         $file_filter
         LIMIT 1
     ")
@@ -576,9 +589,13 @@ cmd_symbol_callees() {
         return 1
     fi
 
+    # Échappement SQL pour prévenir les injections
+    local safe_symbol_name=$(sql_escape "$symbol_name")
+    local safe_file_path=$(sql_escape "$file_path")
+
     local file_filter=""
     if [[ -n "$file_path" ]]; then
-        file_filter="AND f.path = '$file_path'"
+        file_filter="AND f.path = '$safe_file_path'"
     fi
 
     # Trouver le symbole source
@@ -586,7 +603,7 @@ cmd_symbol_callees() {
         SELECT s.id, s.name, s.kind, f.path as file
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE s.name = '$symbol_name'
+        WHERE s.name = '$safe_symbol_name'
         $file_filter
         LIMIT 1
     ")
@@ -645,6 +662,9 @@ cmd_error_history() {
         return 1
     fi
 
+    # Échappement SQL pour prévenir les injections
+    local safe_file_path=$(sql_escape "$file_path")
+
     # Compatible GNU date (Linux) et BSD date (macOS)
     local cutoff_date
     cutoff_date=$(date -d "$days days ago" +%Y-%m-%d 2>/dev/null) || \
@@ -657,7 +677,7 @@ cmd_error_history() {
             discovered_at, resolved_at, resolution, prevention,
             is_regression, jira_ticket
         FROM error_history
-        WHERE (file_path = '$file_path' OR file_path LIKE '%$file_path')
+        WHERE (file_path = '$safe_file_path' OR file_path LIKE '%$safe_file_path')
         AND discovered_at >= '$cutoff_date'
         ORDER BY discovered_at DESC
         LIMIT 20
@@ -673,7 +693,7 @@ cmd_error_history() {
             SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END) as low,
             SUM(CASE WHEN is_regression = 1 THEN 1 ELSE 0 END) as regressions
         FROM error_history
-        WHERE (file_path = '$file_path' OR file_path LIKE '%$file_path')
+        WHERE (file_path = '$safe_file_path' OR file_path LIKE '%$safe_file_path')
         AND discovered_at >= '$cutoff_date'
     ")
 
@@ -705,10 +725,13 @@ cmd_patterns() {
     local file_path="$1"
     local category="$2"
 
+    # Échappement SQL pour prévenir les injections
+    local safe_category=$(sql_escape "$category")
+
     local where_clause="WHERE is_active = 1"
 
     if [[ -n "$category" ]]; then
-        where_clause="$where_clause AND category = '$category'"
+        where_clause="$where_clause AND category = '$safe_category'"
     fi
 
     local patterns=$(sqlite_json "
@@ -742,10 +765,13 @@ cmd_patterns() {
 cmd_architecture_decisions() {
     local module="$1"
 
+    # Échappement SQL pour prévenir les injections
+    local safe_module=$(sql_escape "$module")
+
     local where_clause="WHERE status = 'accepted'"
 
     if [[ -n "$module" ]]; then
-        where_clause="$where_clause AND (affected_modules_json LIKE '%\"$module\"%' OR affected_modules_json IS NULL)"
+        where_clause="$where_clause AND (affected_modules_json LIKE '%\"$safe_module\"%' OR affected_modules_json IS NULL)"
     fi
 
     local decisions=$(sqlite_json "
@@ -774,6 +800,9 @@ cmd_module_summary() {
         return 1
     fi
 
+    # Échappement SQL pour prévenir les injections
+    local safe_module=$(sql_escape "$module")
+
     # Stats fichiers
     local file_stats=$(sqlite_json_one "
         SELECT
@@ -785,7 +814,7 @@ cmd_module_summary() {
             SUM(lines_code) as total_lines,
             AVG(complexity_avg) as avg_complexity
         FROM files
-        WHERE module = '$module'
+        WHERE module = '$safe_module'
     ")
 
     if [[ "$(echo "$file_stats" | jq '.total')" == "0" ]]; then
@@ -801,7 +830,7 @@ cmd_module_summary() {
             SUM(CASE WHEN s.kind = 'macro' THEN 1 ELSE 0 END) as macros
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE f.module = '$module'
+        WHERE f.module = '$safe_module'
     ")
 
     # Erreurs récentes
@@ -809,7 +838,7 @@ cmd_module_summary() {
         SELECT COUNT(*) as count
         FROM error_history e
         JOIN files f ON e.file_id = f.id
-        WHERE f.module = '$module'
+        WHERE f.module = '$safe_module'
         AND e.discovered_at >= date('now', '-90 days')
     " | jq '.count')
 
@@ -819,8 +848,8 @@ cmd_module_summary() {
         FROM file_relations fr
         JOIN files f1 ON fr.source_file_id = f1.id
         JOIN files f2 ON fr.target_file_id = f2.id
-        WHERE f1.module = '$module'
-        AND f2.module != '$module'
+        WHERE f1.module = '$safe_module'
+        AND f2.module != '$safe_module'
         AND f2.module IS NOT NULL
     " | jq '[.[].module]')
 
@@ -829,8 +858,8 @@ cmd_module_summary() {
         FROM file_relations fr
         JOIN files f1 ON fr.source_file_id = f1.id
         JOIN files f2 ON fr.target_file_id = f2.id
-        WHERE f2.module = '$module'
-        AND f1.module != '$module'
+        WHERE f2.module = '$safe_module'
+        AND f1.module != '$safe_module'
         AND f1.module IS NOT NULL
     " | jq '[.[].module]')
 
@@ -877,9 +906,13 @@ cmd_search_symbols() {
     # Convertir les wildcards glob en SQL LIKE
     local sql_pattern=$(echo "$query" | sed 's/\*/%/g; s/\?/_/g')
 
+    # Échappement SQL pour prévenir les injections
+    local safe_pattern=$(sql_escape "$sql_pattern")
+    local safe_kind=$(sql_escape "$kind")
+
     local kind_filter=""
     if [[ -n "$kind" ]]; then
-        kind_filter="AND s.kind = '$kind'"
+        kind_filter="AND s.kind = '$safe_kind'"
     fi
 
     local results=$(sqlite_json "
@@ -887,7 +920,7 @@ cmd_search_symbols() {
             s.name, s.kind, f.path as file, s.signature, s.line_start as line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE s.name LIKE '$sql_pattern'
+        WHERE s.name LIKE '$safe_pattern'
         $kind_filter
         ORDER BY s.name
         LIMIT 50
@@ -897,7 +930,7 @@ cmd_search_symbols() {
         SELECT COUNT(*) as count
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE s.name LIKE '$sql_pattern'
+        WHERE s.name LIKE '$safe_pattern'
         $kind_filter
     " | jq '.count')
 

@@ -14,7 +14,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 import websockets
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# URL du serveur WebSocket CRE_INTERFACE (configurable via env)
+WS_BASE_URL = os.environ.get("CRE_WS_URL", "ws://192.36.128.72:8080")
+# URL HTTP pour l'upload des artifacts
+HTTP_BASE_URL = os.environ.get("CRE_HTTP_URL", "http://192.36.128.72:8080")
 
 
 # =============================================================================
@@ -38,17 +49,7 @@ def strip_ansi(text: str) -> str:
     return text
 
 
-def switch_branch(branch_name: str) -> bool:
-    """Change de branche git."""
-    log_to_stderr(f"Switching to branch: {branch_name}\n")
-    result = subprocess.run(
-        ["git", "checkout", branch_name],
-        capture_output=True,
-        text=True
-    )
-    if result.stdout:
-        log_to_stderr(result.stdout)
-    return result.returncode == 0
+# switch_branch() supprimé - remplacé par WorktreeManager dans .claude/worktree.py
 
 
 # =============================================================================
@@ -70,24 +71,24 @@ class WebSocketNotifier:
 
     STEPS = [
         "setup",           # Initialisation
-        "phase1",          # ANALYZER + SECURITY + REVIEWER (parallèle)
+        "phase1_parallel_analyzer_security_reviewer",          # ANALYZER + SECURITY + REVIEWER (parallèle)
         "phase2_risk",     # RISK
-        "phase2_parallel", # SYNTHESIS + SONAR (parallèle)
-        "phase3",          # META-SYNTHESIS
-        "phase4",          # WEB-SYNTHESIZER
+        "phase2_parallel_synthesis_sonar", # SYNTHESIS + SONAR (parallèle)
+        "phase3_meta_synthesis",          # META-SYNTHESIS
+        "phase4_web_synthesizer",          # WEB-SYNTHESIZER
         "report"           # Envoi du rapport final
     ]
 
     # Mapping agent -> phase
     AGENT_TO_PHASE = {
-        "analyzer": "phase1",
-        "security": "phase1",
-        "reviewer": "phase1",
+        "analyzer": "phase1_parallel_analyzer_security_reviewer",
+        "security": "phase1_parallel_analyzer_security_reviewer",
+        "reviewer": "phase1_parallel_analyzer_security_reviewer",
         "risk": "phase2_risk",
-        "synthesis": "phase2_parallel",
-        "sonar": "phase2_parallel",
-        "meta-synthesis": "phase3",
-        "web-synthesizer": "phase4",
+        "synthesis": "phase2_parallel_synthesis_sonar",
+        "sonar": "phase2_parallel_synthesis_sonar",
+        "meta-synthesis": "phase3_meta_synthesis",
+        "web-synthesizer": "phase4_web_synthesizer",
     }
 
     def __init__(self, websocket):
@@ -97,6 +98,8 @@ class WebSocketNotifier:
         self.action_completed: bool = False
         self.agents_in_phase: dict[str, set] = {}  # phase -> set d'agents lancés
         self.report_path: Optional[str] = None     # Chemin du rapport final
+        # Référence à la tâche de monitoring WebSocket (pour l'annuler avant send_artifact)
+        self.monitor_task: Optional[asyncio.Task] = None
 
     async def send(self, message: dict) -> None:
         """Envoie un message JSON au WebSocket."""
@@ -160,6 +163,19 @@ class WebSocketNotifier:
             await self.step_complete("success", prev_output)
         await self.step_started(new_step)
 
+    async def fail_with_error(self, error_msg: str) -> None:
+        """
+        Termine l'action avec une erreur de manière conforme au protocole.
+        Envoie step_complete(failure) puis action_complete(failure).
+        """
+        # S'assurer qu'on a une step en cours pour le step_complete
+        if not self.current_step:
+            await self.step_started("setup")
+
+        await self.step_log(f"Error: {error_msg}", "stderr")
+        await self.step_complete("failure", f"## Error\n\n{error_msg}")
+        await self.action_complete()
+
     async def on_agent_started(self, agent_type: str) -> None:
         """Gère le lancement d'un agent et la transition de phase."""
         phase = self.AGENT_TO_PHASE.get(agent_type)
@@ -175,32 +191,109 @@ class WebSocketNotifier:
         if self.current_step != phase:
             await self.transition_to(phase, f"Completed {self.current_step}")
 
-    async def report_ready(self, report_path: str) -> None:
-        """Envoie le rapport JSON final via WebSocket."""
-        self.report_path = report_path
+    async def send_artifact(self, file_path: str, artifact_type: str = "report") -> bool:
+        """
+        Envoie un artifact selon le protocole complet:
+        1. Envoie message 'artifact' (notification)
+        2. Attend 'artifact_ready' du serveur
+        3. Upload le fichier via HTTP POST multipart
+
+        Args:
+            file_path: Chemin du fichier artifact
+            artifact_type: Type d'artifact (binary, report, log, coverage, file)
+
+        Returns:
+            True si l'artifact a été uploadé avec succès, False sinon
+        """
+        self.report_path = file_path
+        path = Path(file_path)
+
+        if not path.exists():
+            log_to_stderr(f"\n❌ Artifact file not found: {file_path}\n")
+            return False
 
         try:
-            report_data = json.loads(Path(report_path).read_text())
+            # 1. Envoyer la notification artifact (SANS path/size selon protocole)
             await self.send({
-                "type": "report_ready",
-                "path": report_path,
-                "data": report_data
+                "type": "artifact",
+                "step": self.current_step or "report",
+                "artifact": {
+                    "name": path.name,
+                    "type": artifact_type
+                }
             })
-            log_to_stderr(f"\n📤 Report sent via WebSocket: {report_path}\n")
-        except FileNotFoundError:
-            log_to_stderr(f"\n❌ Report file not found: {report_path}\n")
-            await self.send({
-                "type": "report_error",
-                "path": report_path,
-                "error": "File not found"
-            })
-        except json.JSONDecodeError as e:
-            log_to_stderr(f"\n❌ Invalid JSON in report: {e}\n")
-            await self.send({
-                "type": "report_error",
-                "path": report_path,
-                "error": f"Invalid JSON: {e}"
-            })
+            log_to_stderr(f"\n📤 Artifact notification sent: {path.name}\n")
+
+            # 2. Attendre artifact_ready du serveur (timeout 30s)
+            # D'abord, annuler la tâche de monitoring pour éviter les conflits recv()
+            # (l'analyse est terminée à ce stade, on n'a plus besoin du monitoring)
+            if self.monitor_task and not self.monitor_task.done():
+                self.monitor_task.cancel()
+                try:
+                    await self.monitor_task
+                except asyncio.CancelledError:
+                    pass
+                log_to_stderr("📡 Monitor task cancelled for artifact upload\n")
+
+            try:
+                response = await asyncio.wait_for(self.ws.recv(), timeout=30)
+                data = json.loads(response)
+
+                if data.get("type") != "artifact_ready":
+                    log_to_stderr(f"\n⚠️ Expected 'artifact_ready', got: {data.get('type')}\n")
+                    return False
+
+                artifact_id = data.get("artifactId")
+                upload_url = data.get("uploadUrl")
+
+                if not artifact_id or not upload_url:
+                    log_to_stderr(f"\n❌ Missing artifactId or uploadUrl in response\n")
+                    return False
+
+                log_to_stderr(f"\n✅ Artifact ready: {artifact_id}, uploading to {upload_url}\n")
+
+            except asyncio.TimeoutError:
+                log_to_stderr(f"\n❌ Timeout waiting for artifact_ready\n")
+                return False
+
+            # 3. Upload HTTP du fichier (multipart/form-data)
+            full_url = f"{HTTP_BASE_URL}{upload_url}"
+
+            async with aiohttp.ClientSession() as session:
+                with open(path, 'rb') as f:
+                    form = aiohttp.FormData()
+                    form.add_field(
+                        'file',
+                        f,
+                        filename=path.name,
+                        content_type='application/octet-stream'
+                    )
+
+                    async with session.post(full_url, data=form) as resp:
+                        if resp.status == 200:
+                            result = await resp.json()
+                            log_to_stderr(f"\n✅ Artifact uploaded: {result.get('downloadUrl', '')}\n")
+                            return True
+                        elif resp.status == 409:
+                            log_to_stderr(f"\n⚠️ Artifact already uploaded\n")
+                            return True  # Considéré comme succès
+                        elif resp.status == 413:
+                            log_to_stderr(f"\n❌ Artifact too large (max 500MB)\n")
+                            return False
+                        else:
+                            error_text = await resp.text()
+                            log_to_stderr(f"\n❌ Upload failed ({resp.status}): {error_text}\n")
+                            return False
+
+        except websockets.exceptions.ConnectionClosed:
+            log_to_stderr(f"\n❌ WebSocket closed during artifact upload\n")
+            return False
+        except aiohttp.ClientError as e:
+            log_to_stderr(f"\n❌ HTTP error during upload: {e}\n")
+            return False
+        except Exception as e:
+            log_to_stderr(f"\n❌ Failed to send artifact: {e}\n")
+            return False
 
 
 # =============================================================================
@@ -368,16 +461,27 @@ class ClaudeEventProcessor:
         await self.notifier.transition_to("report", "Analysis phases completed")
         await self.notifier.step_log(f"💰 Cost: ${self.total_cost:.4f}")
 
+        # Construire le résumé spécifique à la phase report
+        report_summary_lines = [f"💰 Cost: ${self.total_cost:.4f}"]
+        step_status = "success"
+
         # Envoyer le rapport JSON si détecté
         if self.pending_report_path:
-            await self.notifier.step_log(f"📤 Sending report: {self.pending_report_path}")
-            await self.notifier.report_ready(self.pending_report_path)
+            await self.notifier.step_log(f"📤 Sending artifact: {self.pending_report_path}")
+            artifact_sent = await self.notifier.send_artifact(self.pending_report_path, "analysis-report")
+            if artifact_sent:
+                report_summary_lines.append(f"📤 Artifact sent: {self.pending_report_path}")
+            else:
+                report_summary_lines.append(f"❌ Failed to send artifact: {self.pending_report_path}")
+                step_status = "failure"
         else:
             log_to_stderr("\n⚠️ No report path detected\n")
             await self.notifier.step_log("⚠️ No report path detected", "stderr")
+            report_summary_lines.append("⚠️ No report path detected")
 
-        # Finaliser
-        await self.notifier.step_complete("success", f"## Result\n\n{self.result_text[:1000]}")
+        # Finaliser avec le résumé spécifique à la phase report
+        report_summary = "\n".join(report_summary_lines)
+        await self.notifier.step_complete(step_status, f"## Report\n\n{report_summary}")
         await self.notifier.action_complete()
 
     async def _handle_error(self, event: dict) -> None:
@@ -424,12 +528,85 @@ async def read_stderr(stream) -> str:
     return "".join(output)
 
 
+async def monitor_websocket(
+    websocket,
+    process: asyncio.subprocess.Process,
+    job_id: str
+) -> None:
+    """
+    Surveille la connexion WebSocket et tue le processus Claude si elle se ferme.
+    Cette tâche tourne en parallèle avec le traitement principal.
+
+    IMPORTANT: Tue le processus UNIQUEMENT si ConnectionClosed est détecté.
+    Les autres erreurs sont ignorées pour éviter de tuer le processus par erreur.
+    Cette tâche est annulée par send_artifact avant l'upload pour éviter les conflits recv().
+    """
+    # Import local pour éviter les problèmes de version
+    from websockets.protocol import State
+
+    should_kill = False  # Flag pour savoir si on doit tuer le processus
+
+    try:
+        # Attendre que le WebSocket se ferme (recv() lève ConnectionClosed)
+        while True:
+            try:
+                # Attendre un message (côté serveur peut envoyer des pings ou fermer)
+                # Timeout de 60s pour ne pas bloquer indéfiniment
+                msg = await asyncio.wait_for(websocket.recv(), timeout=60)
+                # Si on reçoit un message, c'est peut-être un ping du serveur
+                try:
+                    data = json.loads(msg) if msg else {}
+                    if data.get("type") == "ping":
+                        # Répondre au ping si le serveur l'attend
+                        await websocket.send(json.dumps({"type": "pong"}))
+                except (json.JSONDecodeError, Exception):
+                    pass  # Ignorer les erreurs de parsing/envoi
+
+            except asyncio.TimeoutError:
+                # Pas de message depuis 60s, vérifier l'état de la connexion
+                if websocket.state != State.OPEN:
+                    log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket state is {websocket.state.name}, stopping monitor\n")
+                    should_kill = True
+                    break
+                # Connexion toujours ouverte, continuer à surveiller
+                continue
+
+    except websockets.exceptions.ConnectionClosed as e:
+        # SEUL cas où on doit tuer le processus : connexion fermée
+        log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket disconnected (code={e.code}): {e.reason}\n")
+        should_kill = True
+
+    except asyncio.CancelledError:
+        # Tâche annulée (processus terminé normalement), ne pas tuer
+        log_to_stderr(f"\n[Job {job_id}] WebSocket monitor cancelled (process completed)\n")
+        return
+
+    except Exception as e:
+        # Autres erreurs : logger mais NE PAS tuer le processus
+        log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket monitor error (ignored): {type(e).__name__}: {e}\n")
+        return  # Ne pas tuer le processus pour des erreurs inattendues
+
+    # Tuer le processus UNIQUEMENT si should_kill est True
+    if should_kill and process.returncode is None:
+        log_to_stderr(f"\n🛑 [Job {job_id}] Killing Claude process (WebSocket disconnected)...\n")
+        process.terminate()
+        # Attendre un peu puis forcer si nécessaire
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            log_to_stderr(f"\n🛑 [Job {job_id}] Force killing Claude process...\n")
+            process.kill()
+            await process.wait()
+        log_to_stderr(f"\n✅ [Job {job_id}] Claude process terminated.\n")
+
+
 async def launch_claude_stream_json(
     prompt: str,
     request,
+    working_dir: Path,
     max_timeout: int = 7200,
     verbosity: int = 1,
-    ws_url: str = "ws://192.36.128.72:8080/api/ws/jobs"
+    ws_url: str = None
 ) -> dict:
     """
     Lance Claude en mode stream-json avec architecture async native.
@@ -437,13 +614,18 @@ async def launch_claude_stream_json(
     Args:
         prompt: Le prompt complet à envoyer à Claude
         request: L'objet request contenant les infos du job
-        max_timeout: Timeout maximum en secondes (défaut: 30 minutes)
+        working_dir: Répertoire de travail (worktree) pour Claude
+        max_timeout: Timeout maximum en secondes (défaut: 2 heures)
         verbosity: Niveau de verbosité (0=minimal, 1=normal, 2=debug)
-        ws_url: URL du serveur WebSocket
+        ws_url: URL du serveur WebSocket (optionnel, utilise CRE_WS_URL env par défaut)
 
     Returns:
         dict avec 'success', 'result', 'cost', 'messages'
     """
+    # Utiliser la configuration si ws_url non spécifié
+    if ws_url is None:
+        ws_url = f"{WS_BASE_URL}/api/ws/jobs"
+
     cmd = [
         "claude",
         "-p", prompt,
@@ -452,12 +634,24 @@ async def launch_claude_stream_json(
         "--verbose"
     ]
 
+    # Variable pour tracker la tâche de monitoring
+    ws_monitor_task = None
+
     try:
-        log_to_stderr("🚀 Starting Claude (stream-json)...\n")
+        log_to_stderr(f"🚀 Starting Claude (stream-json) in {working_dir}...\n")
 
         # Connexion WebSocket avec timeout
         async with asyncio.timeout(60):
             websocket = await websockets.connect(ws_url + f"/{request.jobId}")
+
+        # Attendre le message "connected" du serveur (avec timeout séparé)
+        async with asyncio.timeout(10):
+            connected_msg = await websocket.recv()
+            connected_data = json.loads(connected_msg)
+            if connected_data.get("type") != "connected":
+                log_to_stderr(f"⚠️ Expected 'connected' message, got: {connected_data.get('type')}\n")
+            else:
+                log_to_stderr(f"✅ WebSocket connected: {connected_data.get('message', '')}\n")
 
         async with websocket:
             notifier = WebSocketNotifier(websocket)
@@ -477,11 +671,22 @@ async def launch_claude_stream_json(
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=dict(os.environ),  # Hérite du PATH complet (fnm, nvm, etc.)
+                    cwd=working_dir,  # Worktree isolé pour ce commit
                     limit=2**20  # 1MB au lieu de 64KB par défaut
                 )
                 # Les phases (phase1, phase2_risk, etc.) démarrent automatiquement
                 # quand les agents Task sont détectés dans _handle_tool_use
                 # Le step_complete de setup est appelé par transition_to() lors du premier agent
+
+                # Démarrer la tâche de monitoring WebSocket
+                # Cette tâche tuera le processus Claude si le WebSocket se ferme
+                # La référence est stockée dans le notifier pour pouvoir l'annuler dans send_artifact
+                ws_monitor_task = asyncio.create_task(
+                    monitor_websocket(websocket, process, request.jobId)
+                )
+                notifier.monitor_task = ws_monitor_task
+
+                ws_disconnected = False  # Flag pour détecter si le WS a causé l'arrêt
 
                 try:
                     # Lire stdout et stderr en parallèle avec timeout
@@ -508,6 +713,30 @@ async def launch_claude_stream_json(
                         "error": f"Timeout after {max_timeout}s"
                     }
 
+                finally:
+                    # Annuler la tâche de monitoring (plus besoin si le processus est fini)
+                    if ws_monitor_task and not ws_monitor_task.done():
+                        ws_monitor_task.cancel()
+                        try:
+                            await ws_monitor_task
+                        except asyncio.CancelledError:
+                            pass
+                    # Vérifier si le WebSocket s'est déconnecté
+                    from websockets.protocol import State
+                    if websocket.state != State.OPEN:
+                        ws_disconnected = True
+
+                # Vérifier si le processus a été tué à cause de la déconnexion WebSocket
+                if ws_disconnected and process.returncode != 0:
+                    log_to_stderr(f"\n⚠️ Process terminated due to WebSocket disconnection\n")
+                    return {
+                        "success": False,
+                        "result": processor.result_text,
+                        "cost": processor.total_cost,
+                        "messages": processor.messages,
+                        "error": "WebSocket disconnected - process terminated to save tokens"
+                    }
+
                 # Finaliser si pas encore fait
                 if not notifier.action_completed:
                     if notifier.current_step:
@@ -529,6 +758,15 @@ async def launch_claude_stream_json(
                 await notifier.step_log(f"Error: {error_msg}", "stderr")
                 await notifier.step_complete("failure", f"Error: {error_msg}")
                 await notifier.action_complete()
+
+                # Nettoyer la tâche de monitoring si elle existe
+                if ws_monitor_task and not ws_monitor_task.done():
+                    ws_monitor_task.cancel()
+                    try:
+                        await ws_monitor_task
+                    except asyncio.CancelledError:
+                        pass
+
                 raise  # Re-raise pour être capturé par le handler externe
 
     except websockets.exceptions.WebSocketException as e:
@@ -547,11 +785,9 @@ async def launch_claude_stream_json(
         log_to_stderr(f"\n❌ {error_msg}\n")
         try:
             async with websockets.connect(ws_url + f"/{request.jobId}") as ws:
-                await ws.send(json.dumps({
-                    "type": "action_error",
-                    "error": error_msg,
-                    "status": "failure"
-                }))
+                notifier = WebSocketNotifier(ws)
+                await notifier.action_started()
+                await notifier.fail_with_error(error_msg)
         except Exception:
             pass  # Best effort
         return {
@@ -567,11 +803,9 @@ async def launch_claude_stream_json(
         log_to_stderr(f"\n❌ Error: {error_msg}\n")
         try:
             async with websockets.connect(ws_url + f"/{request.jobId}") as ws:
-                await ws.send(json.dumps({
-                    "type": "action_error",
-                    "error": error_msg,
-                    "status": "failure"
-                }))
+                notifier = WebSocketNotifier(ws)
+                await notifier.action_started()
+                await notifier.fail_with_error(error_msg)
         except Exception:
             pass  # Best effort
         return {
@@ -584,35 +818,6 @@ async def launch_claude_stream_json(
 
 
 # =============================================================================
-# Point d'entrée pour lancer Claude
+# Note: launch_claude_process() supprimé
+# Utiliser launch_claude_stream_json() directement avec working_dir depuis main.py
 # =============================================================================
-
-def launch_claude_process(request, verbosity: int = 1) -> Optional[dict]:
-    """
-    Lance Claude avec le prompt d'analyse (analyze_py.md).
-    Point d'entrée synchrone qui lance la coroutine async.
-
-    Args:
-        request: L'objet request avec les infos du job
-        verbosity: Niveau de verbosité
-
-    Returns:
-        Le résultat du process Claude ou None si erreur
-    """
-    prompt_path = Path(".claude/commands/analyze_py.md")
-
-    if not prompt_path.exists():
-        log_to_stderr(f"❌ Fichier prompt non trouvé: {prompt_path}\n")
-        return None
-
-    prompt = prompt_path.read_text()
-
-    if request.action == 'issue_detector':
-        return asyncio.run(launch_claude_stream_json(
-            prompt=prompt,
-            request=request,
-            max_timeout=7200,
-            verbosity=verbosity
-        ))
-
-    return None
