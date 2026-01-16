@@ -24,7 +24,7 @@ project:
 # -----------------------------------------------------------------------------
 database:
   # Chemin vers la base SQLite
-  path: ".claude/agentdb/db.sqlite"
+  path: ".claude/data/db.sqlite"
   # Mode WAL pour meilleures performances
   wal_mode: true
   # Timeout en secondes

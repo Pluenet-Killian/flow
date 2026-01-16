@@ -23,9 +23,9 @@ import websockets
 # =============================================================================
 
 # URL du serveur WebSocket CRE_INTERFACE (configurable via env)
-WS_BASE_URL = os.environ.get("CRE_WS_URL", "ws://192.36.128.72:8080")
+WS_BASE_URL = os.environ.get("CRE_WS_URL", "ws://192.36.128.62:8080")
 # URL HTTP pour l'upload des artifacts
-HTTP_BASE_URL = os.environ.get("CRE_HTTP_URL", "http://192.36.128.72:8080")
+HTTP_BASE_URL = os.environ.get("CRE_HTTP_URL", "http://192.36.128.62:8080")
 
 
 # =============================================================================
@@ -66,7 +66,7 @@ class StepInfo:
 class WebSocketNotifier:
     """
     Gère la communication WebSocket pour notifier l'avancement.
-    Encapsule toute la logique de messaging.
+    Encapsule toute la logique de messaging avec support de reconnexion.
     """
 
     STEPS = [
@@ -91,25 +91,164 @@ class WebSocketNotifier:
         "web-synthesizer": "phase4_web_synthesizer",
     }
 
-    def __init__(self, websocket):
+    def __init__(self, websocket, ws_url: str = None, job_id: str = None):
         self.ws = websocket
+        self.ws_url = ws_url      # URL pour reconnexion
+        self.job_id = job_id      # Job ID pour reconnexion
         self.current_step: Optional[str] = None
         self.action_status: str = "success"
         self.action_completed: bool = False
+        self.action_started_sent: bool = False  # Track si action_started a été envoyé
         self.agents_in_phase: dict[str, set] = {}  # phase -> set d'agents lancés
         self.report_path: Optional[str] = None     # Chemin du rapport final
         # Référence à la tâche de monitoring WebSocket (pour l'annuler avant send_artifact)
         self.monitor_task: Optional[asyncio.Task] = None
+        # Queue de messages en cas de déconnexion
+        self._message_queue: list[dict] = []
+        self._connected: bool = True
+        self._reconnect_lock = asyncio.Lock()
+
+    @property
+    def connected(self) -> bool:
+        """Vérifie si le WebSocket est connecté."""
+        if self.ws is None:
+            return False
+        try:
+            from websockets.protocol import State
+            return self.ws.state == State.OPEN
+        except Exception:
+            return False
+
+    async def reconnect(self, max_retries: int = 5, base_delay: float = 1.0) -> bool:
+        """
+        Tente de se reconnecter au WebSocket avec backoff exponentiel.
+
+        Args:
+            max_retries: Nombre maximum de tentatives
+            base_delay: Délai initial entre les tentatives (secondes)
+
+        Returns:
+            True si reconnecté, False sinon
+        """
+        async with self._reconnect_lock:
+            if self.connected:
+                return True
+
+            if not self.ws_url or not self.job_id:
+                log_to_stderr("[WS] Cannot reconnect: missing ws_url or job_id\n")
+                return False
+
+            full_url = f"{self.ws_url}/{self.job_id}"
+
+            for attempt in range(1, max_retries + 1):
+                delay = base_delay * (2 ** (attempt - 1))  # Exponential backoff
+                log_to_stderr(f"\n🔄 [WS] Reconnection attempt {attempt}/{max_retries}...\n")
+
+                try:
+                    # Fermer l'ancienne connexion proprement
+                    if self.ws:
+                        try:
+                            await self.ws.close()
+                        except Exception:
+                            pass
+
+                    # Nouvelle connexion
+                    async with asyncio.timeout(10):
+                        self.ws = await websockets.connect(full_url)
+
+                    # Attendre le message "connected"
+                    async with asyncio.timeout(5):
+                        connected_msg = await self.ws.recv()
+                        connected_data = json.loads(connected_msg)
+                        if connected_data.get("type") == "connected":
+                            log_to_stderr(f"✅ [WS] Reconnected successfully!\n")
+                            self._connected = True
+
+                            # Restaurer l'état côté serveur
+                            await self._restore_state()
+
+                            # Envoyer les messages en queue
+                            await self._flush_queue()
+
+                            return True
+                        else:
+                            log_to_stderr(f"⚠️ [WS] Unexpected message: {connected_data.get('type')}\n")
+
+                except asyncio.TimeoutError:
+                    log_to_stderr(f"⚠️ [WS] Reconnection timeout (attempt {attempt})\n")
+                except websockets.exceptions.WebSocketException as e:
+                    log_to_stderr(f"⚠️ [WS] Reconnection failed: {e}\n")
+                except Exception as e:
+                    log_to_stderr(f"⚠️ [WS] Reconnection error: {type(e).__name__}: {e}\n")
+
+                if attempt < max_retries:
+                    log_to_stderr(f"⏳ [WS] Waiting {delay:.1f}s before next attempt...\n")
+                    await asyncio.sleep(delay)
+
+            log_to_stderr(f"❌ [WS] Failed to reconnect after {max_retries} attempts\n")
+            return False
+
+    async def _restore_state(self) -> None:
+        """Restaure l'état de l'action après reconnexion."""
+        # Re-envoyer action_started si déjà envoyé
+        if self.action_started_sent and not self.action_completed:
+            await self._send_direct({
+                "type": "action_started",
+                "steps": self.STEPS
+            })
+            log_to_stderr(f"📋 [WS] Restored action_started\n")
+
+            # Re-envoyer l'étape en cours si présente
+            if self.current_step:
+                await self._send_direct({
+                    "type": "step_started",
+                    "step": self.current_step
+                })
+                log_to_stderr(f"📋 [WS] Restored current step: {self.current_step}\n")
+
+    async def _flush_queue(self) -> None:
+        """Envoie tous les messages en queue."""
+        if not self._message_queue:
+            return
+
+        log_to_stderr(f"📤 [WS] Flushing {len(self._message_queue)} queued messages...\n")
+        queue_copy = self._message_queue.copy()
+        self._message_queue.clear()
+
+        for msg in queue_copy:
+            try:
+                await self._send_direct(msg)
+            except Exception as e:
+                log_to_stderr(f"⚠️ [WS] Failed to send queued message: {e}\n")
+                # Re-queue le message si échec
+                self._message_queue.append(msg)
+                break
+
+    async def _send_direct(self, message: dict) -> None:
+        """Envoie directement sans queue (utilisé pour restore/flush)."""
+        if self.ws:
+            await self.ws.send(json.dumps(message))
 
     async def send(self, message: dict) -> None:
-        """Envoie un message JSON au WebSocket."""
+        """Envoie un message JSON au WebSocket, avec queue si déconnecté."""
+        if not self.connected:
+            # Queue le message pour envoi après reconnexion
+            self._message_queue.append(message)
+            # Limiter la taille de la queue (garder les 1000 derniers messages)
+            if len(self._message_queue) > 1000:
+                self._message_queue = self._message_queue[-1000:]
+            return
+
         try:
             await self.ws.send(json.dumps(message))
         except websockets.exceptions.ConnectionClosed:
-            log_to_stderr("[WS] Connection closed, cannot send message\n")
+            log_to_stderr("[WS] Connection closed, queuing message\n")
+            self._connected = False
+            self._message_queue.append(message)
 
     async def action_started(self) -> None:
         """Notifie le début de l'action avec les étapes."""
+        self.action_started_sent = True
         await self.send({
             "type": "action_started",
             "steps": self.STEPS
@@ -329,9 +468,10 @@ class ClaudeEventProcessor:
     Sépare la logique de parsing de la logique de notification.
     """
 
-    def __init__(self, notifier: WebSocketNotifier, verbosity: int = 1):
+    def __init__(self, notifier: WebSocketNotifier, verbosity: int = 1, working_dir: Path = None):
         self.notifier = notifier
         self.verbosity = verbosity
+        self.working_dir = working_dir  # Répertoire de travail (worktree) pour résoudre les chemins relatifs
         self.result_text = ""
         self.total_cost = 0.0
         self.messages = []
@@ -393,7 +533,12 @@ class ClaudeEventProcessor:
             # Pattern: reports/web-report-YYYY-MM-DD-commit.json
             match = re.search(r'reports/web-report-[\w-]+\.json', content)
             if match:
-                self.pending_report_path = match.group(0)
+                relative_path = match.group(0)
+                # Construire le chemin absolu depuis le working_dir (worktree)
+                if self.working_dir:
+                    self.pending_report_path = str(self.working_dir / relative_path)
+                else:
+                    self.pending_report_path = relative_path
                 log_to_stderr(f"\n📋 Report will be created: {self.pending_report_path}\n")
 
         tool_log = format_tool_log(tool_name, tool_input)
@@ -498,99 +643,163 @@ class ClaudeEventProcessor:
 # =============================================================================
 
 async def read_stream(stream, processor: ClaudeEventProcessor) -> None:
-    """Lit un stream de manière asynchrone et traite les événements."""
+    """
+    Lit un stream de manière asynchrone et traite les événements JSON.
+
+    Utilise une lecture par chunks pour éviter l'erreur:
+    "Separator is not found, and chunk exceed the limit"
+    qui survient quand Claude génère des lignes JSON très longues
+    (ex: tool_result avec beaucoup de données, rapports markdown).
+    """
+    buffer = b""
+    CHUNK_SIZE = 64 * 1024  # 64KB par lecture
+    MAX_LINE_SIZE = 128 * 1024 * 1024  # 128MB max par ligne (sécurité mémoire)
+
     while True:
-        line = await stream.readline()
-        if not line:
+        # Lire un chunk de données brutes (sans limite de taille de ligne)
+        chunk = await stream.read(CHUNK_SIZE)
+        if not chunk:
+            # Fin du stream - traiter le reste du buffer s'il y en a
+            if buffer:
+                await _process_json_line(buffer.decode('utf-8', errors='replace').strip(), processor)
             break
 
-        line = line.decode('utf-8', errors='replace').strip()
-        if not line:
-            continue
+        buffer += chunk
 
-        try:
-            event = json.loads(line)
-            await processor.process_event(event)
-        except json.JSONDecodeError:
-            log_to_stderr(f"{line}\n")
+        # Protection mémoire: si le buffer devient trop grand sans newline, on a un problème
+        if len(buffer) > MAX_LINE_SIZE and b'\n' not in buffer:
+            log_to_stderr(f"\n⚠️ Warning: JSON line exceeds {MAX_LINE_SIZE // (1024*1024)}MB limit, truncating\n")
+            # Traiter ce qu'on a et recommencer
+            await _process_json_line(buffer[:MAX_LINE_SIZE].decode('utf-8', errors='replace').strip(), processor)
+            buffer = buffer[MAX_LINE_SIZE:]
+
+        # Traiter toutes les lignes complètes dans le buffer
+        while b'\n' in buffer:
+            line_bytes, buffer = buffer.split(b'\n', 1)
+            line = line_bytes.decode('utf-8', errors='replace').strip()
+            if line:
+                await _process_json_line(line, processor)
+
+
+async def _process_json_line(line: str, processor: ClaudeEventProcessor) -> None:
+    """Traite une ligne JSON individuelle."""
+    if not line:
+        return
+    try:
+        event = json.loads(line)
+        await processor.process_event(event)
+    except json.JSONDecodeError:
+        # Ligne non-JSON (ex: output brut de Claude)
+        log_to_stderr(f"{line}\n")
 
 
 async def read_stderr(stream) -> str:
-    """Lit stderr de manière asynchrone."""
+    """
+    Lit stderr de manière asynchrone avec lecture par chunks.
+    Même approche que read_stream() pour éviter les problèmes de buffer.
+    """
     output = []
+    buffer = b""
+    CHUNK_SIZE = 64 * 1024  # 64KB par lecture
+
     while True:
-        line = await stream.readline()
-        if not line:
+        chunk = await stream.read(CHUNK_SIZE)
+        if not chunk:
+            # Traiter le reste du buffer à la fin
+            if buffer:
+                decoded = buffer.decode('utf-8', errors='replace')
+                output.append(decoded)
+                log_to_stderr(f"[stderr] {decoded}")
             break
-        decoded = line.decode('utf-8', errors='replace')
-        output.append(decoded)
-        log_to_stderr(f"[stderr] {decoded}")
+
+        buffer += chunk
+
+        # Traiter toutes les lignes complètes
+        while b'\n' in buffer:
+            line_bytes, buffer = buffer.split(b'\n', 1)
+            decoded = line_bytes.decode('utf-8', errors='replace') + '\n'
+            output.append(decoded)
+            log_to_stderr(f"[stderr] {decoded}")
+
     return "".join(output)
 
 
 async def monitor_websocket(
-    websocket,
+    notifier: WebSocketNotifier,
     process: asyncio.subprocess.Process,
-    job_id: str
+    job_id: str,
+    max_reconnect_retries: int = 5
 ) -> None:
     """
-    Surveille la connexion WebSocket et tue le processus Claude si elle se ferme.
-    Cette tâche tourne en parallèle avec le traitement principal.
+    Surveille la connexion WebSocket et tente une reconnexion si elle se ferme.
+    Ne tue le processus Claude que si la reconnexion échoue après plusieurs tentatives.
 
-    IMPORTANT: Tue le processus UNIQUEMENT si ConnectionClosed est détecté.
-    Les autres erreurs sont ignorées pour éviter de tuer le processus par erreur.
-    Cette tâche est annulée par send_artifact avant l'upload pour éviter les conflits recv().
+    Args:
+        notifier: Le WebSocketNotifier (contient le websocket et peut reconnecter)
+        process: Le processus Claude à surveiller
+        job_id: ID du job pour les logs
+        max_reconnect_retries: Nombre max de tentatives de reconnexion
     """
-    # Import local pour éviter les problèmes de version
     from websockets.protocol import State
 
-    should_kill = False  # Flag pour savoir si on doit tuer le processus
+    while True:
+        try:
+            # Vérifier que le websocket est disponible
+            if notifier.ws is None:
+                log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket is None, attempting reconnect...\n")
+                if not await notifier.reconnect(max_retries=max_reconnect_retries):
+                    break  # Reconnexion échouée, sortir pour kill
+                continue
 
-    try:
-        # Attendre que le WebSocket se ferme (recv() lève ConnectionClosed)
-        while True:
+            # Attendre un message (côté serveur peut envoyer des pings ou fermer)
             try:
-                # Attendre un message (côté serveur peut envoyer des pings ou fermer)
-                # Timeout de 60s pour ne pas bloquer indéfiniment
-                msg = await asyncio.wait_for(websocket.recv(), timeout=60)
-                # Si on reçoit un message, c'est peut-être un ping du serveur
+                msg = await asyncio.wait_for(notifier.ws.recv(), timeout=60)
+                # Traiter les pings du serveur
                 try:
                     data = json.loads(msg) if msg else {}
                     if data.get("type") == "ping":
-                        # Répondre au ping si le serveur l'attend
-                        await websocket.send(json.dumps({"type": "pong"}))
+                        await notifier.ws.send(json.dumps({"type": "pong"}))
                 except (json.JSONDecodeError, Exception):
-                    pass  # Ignorer les erreurs de parsing/envoi
+                    pass
 
             except asyncio.TimeoutError:
-                # Pas de message depuis 60s, vérifier l'état de la connexion
-                if websocket.state != State.OPEN:
-                    log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket state is {websocket.state.name}, stopping monitor\n")
-                    should_kill = True
-                    break
-                # Connexion toujours ouverte, continuer à surveiller
+                # Pas de message depuis 60s, vérifier l'état
+                if notifier.ws and notifier.ws.state != State.OPEN:
+                    log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket state: {notifier.ws.state.name}\n")
+                    # Tenter reconnexion
+                    if not await notifier.reconnect(max_retries=max_reconnect_retries):
+                        break  # Reconnexion échouée
                 continue
 
-    except websockets.exceptions.ConnectionClosed as e:
-        # SEUL cas où on doit tuer le processus : connexion fermée
-        log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket disconnected (code={e.code}): {e.reason}\n")
-        should_kill = True
+        except websockets.exceptions.ConnectionClosed as e:
+            log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket disconnected (code={e.code}): {e.reason}\n")
+            log_to_stderr(f"🔄 [Job {job_id}] Attempting reconnection...\n")
 
-    except asyncio.CancelledError:
-        # Tâche annulée (processus terminé normalement), ne pas tuer
-        log_to_stderr(f"\n[Job {job_id}] WebSocket monitor cancelled (process completed)\n")
-        return
+            # Tenter reconnexion au lieu de tuer
+            if await notifier.reconnect(max_retries=max_reconnect_retries):
+                log_to_stderr(f"✅ [Job {job_id}] Reconnected, continuing monitoring\n")
+                continue
+            else:
+                log_to_stderr(f"❌ [Job {job_id}] Reconnection failed after {max_reconnect_retries} attempts\n")
+                break  # Sortir pour kill
 
-    except Exception as e:
-        # Autres erreurs : logger mais NE PAS tuer le processus
-        log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket monitor error (ignored): {type(e).__name__}: {e}\n")
-        return  # Ne pas tuer le processus pour des erreurs inattendues
+        except asyncio.CancelledError:
+            # Tâche annulée (processus terminé normalement)
+            log_to_stderr(f"\n[Job {job_id}] WebSocket monitor cancelled (process completed)\n")
+            return  # Ne pas tuer
 
-    # Tuer le processus UNIQUEMENT si should_kill est True
-    if should_kill and process.returncode is None:
-        log_to_stderr(f"\n🛑 [Job {job_id}] Killing Claude process (WebSocket disconnected)...\n")
+        except Exception as e:
+            log_to_stderr(f"\n⚠️ [Job {job_id}] WebSocket monitor error: {type(e).__name__}: {e}\n")
+            # Pour les autres erreurs, tenter une reconnexion
+            if await notifier.reconnect(max_retries=max_reconnect_retries):
+                continue
+            break
+
+    # Arrivé ici = reconnexion impossible après max_retries
+    # Tuer le processus pour économiser les tokens
+    if process.returncode is None:
+        log_to_stderr(f"\n🛑 [Job {job_id}] Killing Claude process (reconnection failed)...\n")
         process.terminate()
-        # Attendre un peu puis forcer si nécessaire
         try:
             await asyncio.wait_for(process.wait(), timeout=5)
         except asyncio.TimeoutError:
@@ -654,8 +863,9 @@ async def launch_claude_stream_json(
                 log_to_stderr(f"✅ WebSocket connected: {connected_data.get('message', '')}\n")
 
         async with websocket:
-            notifier = WebSocketNotifier(websocket)
-            processor = ClaudeEventProcessor(notifier, verbosity)
+            # Créer le notifier avec les infos pour reconnexion
+            notifier = WebSocketNotifier(websocket, ws_url=ws_url, job_id=request.jobId)
+            processor = ClaudeEventProcessor(notifier, verbosity, working_dir)
 
             try:
                 # Démarrer l'action
@@ -664,25 +874,24 @@ async def launch_claude_stream_json(
                 await notifier.step_log("Initializing Claude stream-json...")
 
                 # Lancer le processus Claude
-                # limit=1MB pour éviter "Separator is found, but chunk is longer than limit"
-                # quand Claude génère des lignes JSON très longues (rapports avec markdown)
+                # Note: on utilise read() par chunks dans read_stream/read_stderr
+                # au lieu de readline(), donc 'limit' n'est plus critique.
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=dict(os.environ),  # Hérite du PATH complet (fnm, nvm, etc.)
                     cwd=working_dir,  # Worktree isolé pour ce commit
-                    limit=2**20  # 1MB au lieu de 64KB par défaut
                 )
                 # Les phases (phase1, phase2_risk, etc.) démarrent automatiquement
                 # quand les agents Task sont détectés dans _handle_tool_use
                 # Le step_complete de setup est appelé par transition_to() lors du premier agent
 
-                # Démarrer la tâche de monitoring WebSocket
-                # Cette tâche tuera le processus Claude si le WebSocket se ferme
-                # La référence est stockée dans le notifier pour pouvoir l'annuler dans send_artifact
+                # Démarrer la tâche de monitoring WebSocket avec reconnexion automatique
+                # Cette tâche tentera de reconnecter si le WebSocket se ferme
+                # Ne tuera le processus que si la reconnexion échoue après plusieurs tentatives
                 ws_monitor_task = asyncio.create_task(
-                    monitor_websocket(websocket, process, request.jobId)
+                    monitor_websocket(notifier, process, request.jobId)
                 )
                 notifier.monitor_task = ws_monitor_task
 

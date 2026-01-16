@@ -32,7 +32,15 @@ TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 # Import du gestionnaire de worktrees
 import sys
 sys.path.insert(0, str(Path(__file__).parent / ".claude"))
+sys.path.insert(0, str(Path(__file__).parent / ".claude" / "scripts"))
 from worktree import WorktreeManager, async_cleanup_expired
+
+# Import du validateur d'issues (optionnel)
+try:
+    from validate_issues import IssueValidator, ValidationConfig, ReportValidationResult
+    VALIDATOR_AVAILABLE = True
+except ImportError:
+    VALIDATOR_AVAILABLE = False
 
 
 # =============================================================================
@@ -318,6 +326,54 @@ async def transform_sonar_report(
         return None
 
 
+# =============================================================================
+# Report Validation
+# =============================================================================
+
+def validate_report(report_path: Path, strict: bool = False) -> dict | None:
+    """
+    Valide la qualité d'un rapport d'issues.
+
+    Args:
+        report_path: Chemin vers le fichier JSON du rapport
+        strict: Utiliser le mode strict (longueurs minimales plus élevées)
+
+    Returns:
+        Dict avec les résultats de validation ou None si validateur non disponible
+    """
+    if not VALIDATOR_AVAILABLE:
+        log_to_stderr("[Validation] Validateur non disponible\n")
+        return None
+
+    if not report_path.exists():
+        log_to_stderr(f"[Validation] Fichier introuvable: {report_path}\n")
+        return None
+
+    # Configurer le validateur
+    config = ValidationConfig()
+    if strict:
+        config.min_where_length = 300
+        config.min_why_length = 400
+        config.min_how_length = 300
+
+    validator = IssueValidator(config)
+    result = validator.validate_report(report_path)
+
+    log_to_stderr(f"[Validation] {result.valid_issues}/{result.total_issues} issues valides\n")
+    if not result.is_valid:
+        log_to_stderr(f"[Validation] Problèmes détectés:\n")
+        for err_type, count in sorted(result.summary.items(), key=lambda x: -x[1])[:5]:
+            log_to_stderr(f"  - {err_type}: {count}\n")
+
+    return {
+        "is_valid": result.is_valid,
+        "total_issues": result.total_issues,
+        "valid_issues": result.valid_issues,
+        "invalid_issues": result.invalid_issues,
+        "summary": result.summary
+    }
+
+
 @dataclass
 class GitContext:
     """Contexte git résolu pour l'analyse."""
@@ -370,6 +426,32 @@ def _fallback_to_main_branch(commit_sha: str) -> tuple[str, str]:
     # Dernier recours: premier commit du repo
     success, first_commit = run_git_command(['rev-list', '--max-parents=0', 'HEAD'])
     return "unknown", first_commit if success else commit_sha
+
+
+def is_branch_at_origin(branch_name: str) -> bool:
+    """
+    Vérifie si la branche locale est au même point que origin.
+    Retourne True si origin/<branch> existe et pointe sur le même commit.
+    """
+    # Vérifier si origin/<branch> existe
+    success, origin_sha = run_git_command(['rev-parse', f'origin/{branch_name}'])
+    if not success:
+        return False
+
+    # Vérifier si la branche locale pointe sur le même commit
+    success, local_sha = run_git_command(['rev-parse', branch_name])
+    if not success:
+        return False
+
+    return origin_sha == local_sha
+
+
+def get_first_commit() -> str | None:
+    """
+    Retourne le premier commit du repo (root commit).
+    """
+    success, first = run_git_command(['rev-list', '--max-parents=0', 'HEAD'])
+    return first if success else None
 
 
 def detect_parent_branch(commit_sha: str, current_branch: str) -> tuple[str, str]:
@@ -507,9 +589,20 @@ def resolve_git_context(git_param: Optional[str], commit_sha: str, branch_name: 
         GitContext avec toutes les informations nécessaires
     """
     if git_param is None or git_param == "0":
-        # Mode 1: Auto-détection de la branche parente
-        parent_branch, from_commit = detect_parent_branch(commit_sha, branch_name)
-        detection_mode = "auto"
+        # Cas spécial: branche principale sans divergence avec origin
+        # (git show-branch -a montre que local et origin sont au même commit)
+        main_branches = ['main', 'master', 'develop']
+        if branch_name in main_branches and is_branch_at_origin(branch_name):
+            # Utiliser le premier commit du repo pour analyser tout l'historique
+            from_commit = get_first_commit()
+            if not from_commit:
+                raise ValueError("Cannot find first commit of repository")
+            parent_branch = "root"
+            detection_mode = "full-history"
+        else:
+            # Mode normal: Auto-détection de la branche parente
+            parent_branch, from_commit = detect_parent_branch(commit_sha, branch_name)
+            detection_mode = "auto"
     else:
         # Mode 2: Hash spécifié
         # Vérifier que le hash est valide
@@ -1122,3 +1215,49 @@ def delete_worktree(commit_sha: str):
             status_code=500,
             detail=f"Failed to delete worktree for {commit_sha}"
         )
+
+
+# =============================================================================
+# Routes Admin (Validation)
+# =============================================================================
+
+class ValidateRequest(BaseModel):
+    """Requête de validation d'un rapport."""
+    report_path: str
+    strict: bool = False
+
+
+@app.post("/admin/validate")
+def validate_report_api(request: ValidateRequest):
+    """
+    Valide la qualité d'un rapport d'issues.
+
+    Args:
+        request: Chemin du rapport et options
+
+    Returns:
+        Résultats de validation
+    """
+    if not VALIDATOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Validator module not available"
+        )
+
+    report_path = Path(request.report_path)
+
+    if not report_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Report not found: {request.report_path}"
+        )
+
+    result = validate_report(report_path, strict=request.strict)
+
+    if result is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Validation failed"
+        )
+
+    return result

@@ -115,12 +115,9 @@ class WorktreeManager:
 
         def _create():
             if wt_path.exists():
-                if self.validate_worktree(commit_sha):
-                    log_to_stderr(f"[Worktree] Réutilisation: {wt_path}\n")
-                    return wt_path
-                else:
-                    log_to_stderr(f"[Worktree] Worktree corrompu, recréation: {wt_path}\n")
-                    self._force_remove_worktree(commit_sha)
+                # Toujours nettoyer et recréer pour avoir un état propre
+                log_to_stderr(f"[Worktree] Nettoyage du worktree existant: {wt_path}\n")
+                self._force_remove_worktree(commit_sha)
 
             log_to_stderr(f"[Worktree] Création pour {commit_sha[:12]}...\n")
 
@@ -385,6 +382,25 @@ class WorktreeManager:
                             lock_file.unlink()
             except Exception as e:
                 log_to_stderr(f"[Worktree] Erreur inspection {entry}: {e}\n")
+
+        # Nettoyer les fichiers .lock orphelins (sans répertoire correspondant)
+        orphan_locks = 0
+        for entry in self.base_path.iterdir():
+            if entry.suffix != ".lock":
+                continue
+            # Vérifier si le répertoire correspondant existe
+            worktree_name = entry.stem  # "abc123.lock" -> "abc123"
+            worktree_dir = self.base_path / worktree_name
+            if not worktree_dir.exists():
+                try:
+                    entry.unlink()
+                    orphan_locks += 1
+                    log_to_stderr(f"[Worktree] Lock orphelin supprimé: {entry.name}\n")
+                except Exception as e:
+                    log_to_stderr(f"[Worktree] Erreur suppression lock {entry}: {e}\n")
+
+        if orphan_locks > 0:
+            log_to_stderr(f"[Worktree] {orphan_locks} lock(s) orphelin(s) nettoyé(s)\n")
 
         if cleaned > 0:
             log_to_stderr(f"[Worktree] {cleaned} worktree(s) nettoyé(s)\n")
