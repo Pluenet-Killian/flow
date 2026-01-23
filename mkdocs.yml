@@ -69,8 +69,8 @@ markdown_extensions:
       permalink: true
 
 nav:
-  - Accueil:
-      - Introduction: 01-introduction-et-philosophie.md
+  - Accueil: index.md
+  - Introduction: 01-introduction-et-philosophie.md
 
   - Architecture:
       - Vue Globale: 02-architecture-globale.md

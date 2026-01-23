@@ -449,7 +449,7 @@ flowchart TB
         REV["REVIEWER<br/>(qualite)"]
     end
 
-    subgraph PHASE2["Phase 2: RISK puis Enrichissement"]
+    subgraph PHASE2["Phase 2: RISK"]
         RISK["RISK<br/>(attend Phase 1)"]
         direction LR
         SYN["SYNTHESIS<br/>(fusion 4 agents)"]
@@ -484,27 +484,57 @@ flowchart TB
     class WEB phase4
 ```
 
+### Steps WebSocket (claude.py)
+
+Le streaming WebSocket utilise ces etapes definies dans `WebSocketNotifier.STEPS` :
+
+| Step | Description |
+|------|-------------|
+| `setup` | Initialisation de Claude stream-json |
+| `phase1_parallel_analyzer_security_reviewer` | ANALYZER + SECURITY + REVIEWER (parallele) |
+| `phase2_risk` | RISK (sequentiel, attend Phase 1) |
+| `phase2_parallel_synthesis_sonar` | SYNTHESIS + SONAR (parallele) |
+| `phase3_meta_synthesis` | META-SYNTHESIS |
+| `phase4_web_synthesizer` | WEB-SYNTHESIZER |
+| `report` | Envoi du rapport final (artifact) |
+
 ### Donnees Produites par Phase
 
 | Phase | Agents | Output |
 |-------|--------|--------|
 | 1 | analyzer, security, reviewer (parallele) | 3 rapports individuels (`.md` + JSON) |
-| 2 | risk (sequentiel) | `risk.md` + JSON |
-| 2 | synthesis + sonar (parallele) | `REPORT.md` + `sonar-enriched.json` |
+| 2a | risk (sequentiel) | `risk.md` + JSON |
+| 2b | synthesis + sonar (parallele) | `REPORT.md` + `sonar-enriched.json` |
 | 3 | meta-synthesis | `meta-synthesis.json` |
 | 4 | web-synthesizer | `web-report-{date}-{commit}.json` |
 
 ---
 
-## Support Multi-Branche
+## Support Multi-Branche et Worktrees
 
-AgentDB supporte l'analyse parallele de plusieurs branches grace a une architecture hybride :
+AgentDB supporte l'analyse parallele de plusieurs branches grace a une architecture hybride avec git worktrees :
+
+### Architecture des Worktrees
+
+```
+/tmp/cre-worktrees/
+├── abc123def456/              # Worktree par commit SHA (12 chars)
+│   ├── .claude/               # Symlinks vers repo principal
+│   │   ├── config -> ...      # Config partagee
+│   │   ├── agents -> ...      # Agents partages
+│   │   ├── scripts -> ...     # Scripts partages
+│   │   └── logs/              # Logs locaux isoles
+│   ├── src/                   # Code au commit specifique
+│   └── reports -> ...         # Symlink vers repo principal
+```
+
+### Architecture du Cache AgentDB
 
 ```
 /tmp/cre-agentdb-cache/
 ├── branches/
 │   ├── main/
-│   │   ├── current.sqlite      # Index courant
+│   │   ├── current.sqlite      # Index courant de la branche
 │   │   ├── checkpoint.json     # {"commit": "...", "timestamp": ...}
 │   │   └── snapshots/
 │   │       └── abc123.sqlite   # Snapshots historiques
@@ -518,13 +548,16 @@ AgentDB supporte l'analyse parallele de plusieurs branches grace a une architect
 |---------|------|
 | `agentdb_manager.py` | Gestionnaire de caches par branche |
 | `worktree.py` | Gestionnaire git worktrees pour analyses paralleles |
-| `shared.sqlite` | Base partagee (checkpoints, historique) |
+| `shared.sqlite` | Base partagee (symlink vers checkpoints, historique) |
+| `index.sqlite` | Index du code par branche (cache incremental) |
 
 ### Strategie
 
+- **Worktrees** : Chaque analyse s'execute dans un git worktree isole (TTL 24h)
 - **`shared.sqlite`** : Symlink vers repo principal (checkpoints, historique des erreurs)
 - **`index.sqlite`** : Cache par branche avec incrementalite
 - **`snapshots/`** : Pour retour arriere ou branches divergentes
+- **Symlinks** : Config, agents et scripts sont partages via symlinks
 
 ---
 

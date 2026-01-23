@@ -54,13 +54,57 @@ Sortie attendue :
       "args": ["-m", "mcp.agentdb.server"],
       "cwd": "${workspaceFolder}/.claude",
       "env": {
-        "AGENTDB_PATH": "${workspaceFolder}/.claude/agentdb/db.sqlite",
+        "AGENTDB_PATH": "${workspaceFolder}/.claude/data/db.sqlite",
         "AGENTDB_LOG_LEVEL": "INFO"
       }
     }
   }
 }
 ```
+
+### 1.3 Configurer les Variables d'Environnement
+
+```bash
+# Copier le template
+cp .env.example .env
+
+# Editer avec vos valeurs
+nano .env
+```
+
+**Contenu de `.env`** :
+
+```bash
+# =============================================================================
+# SonarCloud (requis pour l'integration Sonar)
+# =============================================================================
+# Token API SonarCloud (generer sur https://sonarcloud.io/account/security)
+SONAR_TOKEN=your_sonarcloud_token_here
+
+# Cle du projet SonarCloud (format: organization_repository)
+SONAR_PROJECT_KEY=your_org_your_repo
+
+# =============================================================================
+# WebSocket Server (optionnel)
+# =============================================================================
+# URL du serveur WebSocket pour les notifications temps reel
+# WS_BASE_URL=ws://localhost:3001
+
+# =============================================================================
+# Mode Test (optionnel)
+# =============================================================================
+# Activer le mode test (1 = actif, 0 = desactive)
+# TEST_MODE=0
+```
+
+| Variable | Description | Requis |
+|----------|-------------|--------|
+| `SONAR_TOKEN` | Token API SonarCloud | Pour agent SONAR |
+| `SONAR_PROJECT_KEY` | Cle du projet (format: `org_repo`) | Pour agent SONAR |
+| `WS_BASE_URL` | URL WebSocket notifications | Optionnel |
+| `TEST_MODE` | Active le mode test | Optionnel |
+
+> **Note** : Sans `SONAR_TOKEN`, l'agent SONAR sera ignore et l'analyse continuera sans enrichissement SonarCloud.
 
 ---
 
@@ -127,17 +171,17 @@ AgentDB Bootstrap v2.0
       [OK]
 
 Bootstrap completed in 45.2 seconds
-Database: .claude/agentdb/db.sqlite (2.5 MB)
+Database: .claude/data/db.sqlite (2.5 MB)
 ```
 
 ### 2.3 Verifier la Base Creee
 
 ```bash
 # Verifier que la base existe
-ls -lh .claude/agentdb/db.sqlite
+ls -lh .claude/data/db.sqlite
 
 # Statistiques rapides avec sqlite3
-sqlite3 .claude/agentdb/db.sqlite "
+sqlite3 .claude/data/db.sqlite "
   SELECT 'Files:', COUNT(*) FROM files
   UNION ALL
   SELECT 'Symbols:', COUNT(*) FROM symbols
@@ -375,6 +419,83 @@ Resultat : .claude/reports/{date}-{commit}/
 ╚═══════════════════════════════════════════════════════════════╝
 ```
 
+### Variantes de Commandes
+
+| Commande | Fichier | Description |
+|----------|---------|-------------|
+| `/analyze` | `analyze.md` | Version principale avec frontmatter YAML. Contexte Git pre-calcule par `main.py` |
+| `/analyze_py` | `analyze_py.md` | Variante avec clarifications sur `git merge-base` |
+| `/analyse_py2` | `analyse_py2.md` | Alias identique a `/analyze_py` |
+| `/one` | `one.md` | Commande de test simple |
+
+> **Note** : Les trois versions `/analyze`, `/analyze_py` et `/analyse_py2` ont le meme comportement fonctionnel. Seule `/analyze` possede le frontmatter YAML officiel.
+
+---
+
+## Etape 5.6 : API FastAPI (main.py)
+
+L'API FastAPI permet de declencher des analyses de maniere programmatique.
+
+### Demarrer le Serveur
+
+```bash
+uvicorn main:app --reload --port 8000
+```
+
+### Endpoints Disponibles
+
+| Methode | Endpoint | Description |
+|---------|----------|-------------|
+| `GET` | `/` | Health check |
+| `POST` | `/trigger` | Declenche une analyse Claude |
+| `GET` | `/jobs/{job_id}` | Statut d'un job |
+| `GET` | `/jobs` | Liste tous les jobs |
+| `GET` | `/admin/worktrees` | Liste les worktrees actifs |
+| `POST` | `/admin/worktrees/cleanup` | Nettoie les worktrees expires |
+| `DELETE` | `/admin/worktrees/{commit_sha}` | Supprime un worktree |
+| `POST` | `/admin/validate` | Valide un rapport d'issues |
+
+### Declencher une Analyse
+
+```bash
+curl -X POST http://localhost:8000/trigger \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jobId": "job-123",
+    "branchName": "feature/auth",
+    "commitSha": "abc123def456",
+    "action": "issue_detector",
+    "lastAnalyzedCommit": null
+  }'
+```
+
+### Reponse
+
+```json
+{
+  "jobId": "job-123",
+  "status": "accepted",
+  "message": "Job accepted and queued for processing"
+}
+```
+
+### Statuts des Jobs
+
+| Statut | Description |
+|--------|-------------|
+| `pending` | Job en attente |
+| `running` | Analyse en cours |
+| `completed` | Analyse terminee avec succes |
+| `failed` | Analyse echouee |
+
+### Mode Test
+
+Activez le mode test avec `TEST_MODE=1` pour tester le protocole WebSocket sans lancer Claude :
+
+```bash
+TEST_MODE=1 uvicorn main:app --reload --port 8000
+```
+
 ---
 
 ## Etape 6 : Cas d'Usage Avance
@@ -491,9 +612,9 @@ network_utils.
 
 ```bash
 # Supprimer la base existante
-rm -f .claude/agentdb/db.sqlite
-rm -f .claude/agentdb/db.sqlite-wal
-rm -f .claude/agentdb/db.sqlite-shm
+rm -f .claude/data/db.sqlite
+rm -f .claude/data/db.sqlite-wal
+rm -f .claude/data/db.sqlite-shm
 
 # Relancer le bootstrap
 python .claude/scripts/bootstrap.py
@@ -502,10 +623,10 @@ python .claude/scripts/bootstrap.py
 ### 7.3 Verification d'Integrite
 
 ```bash
-sqlite3 .claude/agentdb/db.sqlite "PRAGMA integrity_check;"
+sqlite3 .claude/data/db.sqlite "PRAGMA integrity_check;"
 # Doit retourner: ok
 
-sqlite3 .claude/agentdb/db.sqlite "PRAGMA foreign_key_check;"
+sqlite3 .claude/data/db.sqlite "PRAGMA foreign_key_check;"
 # Doit etre vide (pas d'erreurs)
 ```
 
@@ -531,10 +652,10 @@ sqlite3 .claude/agentdb/db.sqlite "PRAGMA foreign_key_check;"
 
 ```bash
 # Hebdomadaire : Vacuum de la base
-sqlite3 .claude/agentdb/db.sqlite "VACUUM;"
+sqlite3 .claude/data/db.sqlite "VACUUM;"
 
 # Mensuel : Analyse des statistiques
-sqlite3 .claude/agentdb/db.sqlite "ANALYZE;"
+sqlite3 .claude/data/db.sqlite "ANALYZE;"
 ```
 
 ---

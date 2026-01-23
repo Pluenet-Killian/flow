@@ -173,44 +173,65 @@ int init() {
 ```
 .claude/
 |-- agentdb/                 # Coeur de la bibliotheque
-|   |-- schema.sql          # Schema SQLite (11 tables)
-|   |-- db.sqlite           # Base principale
-|   |-- shared.sqlite       # Base partagee multi-branche
+|   |-- schema.sql          # Schema SQLite (11+ tables)
 |   |-- models.py           # Modeles de donnees
-|   |-- db.py               # Gestion de connexion
-|   |-- crud.py             # Operations CRUD (2300+ lignes)
-|   |-- queries.py          # Requetes graphe recursives
-|   |-- config.py           # Configuration
-|   |-- indexer.py          # Parseur de code (1700+ lignes)
-|   +-- query.sh            # Interface shell pour agents
+|   |-- db.py               # Gestion de connexion SQLite
+|   |-- crud.py             # Operations CRUD
+|   |-- queries.py          # Requetes graphe recursives (CTE)
+|   |-- config.py           # Configuration YAML loader
+|   |-- indexer.py          # Parseur de code multi-langage
+|   |-- tree_sitter_parser.py # Parsing via tree-sitter
+|   |-- hybrid_lsp.py       # Integration LSP hybride
+|   |-- pattern_learner.py  # Apprentissage de patterns
+|   |-- semantic.py         # Analyse semantique
+|   |-- query.sh            # Interface shell pour agents
+|   +-- requirements.txt    # Dependances Python
+|
+|-- data/                    # Donnees persistantes
+|   +-- db.sqlite           # Base principale SQLite
 |
 |-- agents/                  # 8 agents specialises
 |   |-- analyzer.md         # Phase 1 - Analyse d'impact
 |   |-- security.md         # Phase 1 - Vulnerabilites
 |   |-- reviewer.md         # Phase 1 - Code review
-|   |-- risk.md             # Phase 1 - Scoring risque
-|   |-- synthesis.md        # Phase 2 - Fusion 4 agents
-|   |-- sonar.md            # Phase 2 - Enrichit SonarQube
+|   |-- risk.md             # Phase 2 - Scoring risque
+|   |-- synthesis.md        # Phase 2 - Fusion rapports
+|   |-- sonar.md            # Phase 2 - Enrichit SonarCloud
 |   |-- meta-synthesis.md   # Phase 3 - Consolidation
-|   +-- web-synthesizer.md  # Phase 4 - JSON pour site
+|   +-- web-synthesizer.md  # Phase 4 - JSON pour site web
 |
-|-- commands/                # Commandes CLI
-|   +-- analyze.md          # /analyze - Orchestration complete
+|-- commands/                # Commandes Claude Code
+|   |-- analyze.md          # /analyze - Orchestration (frontmatter, contexte main.py)
+|   |-- analyze_py.md       # /analyze_py - Variante avec details git merge-base
+|   |-- analyse_py2.md      # /analyse_py2 - Alias de analyze_py
+|   +-- one.md              # /one - Commande de test simple
 |
 |-- mcp/                     # Serveurs MCP
-|   |-- agentdb/            # AgentDB MCP (10 outils)
-|   +-- jira/               # Jira MCP (optionnel)
+|   +-- agentdb/            # AgentDB MCP
+|       |-- server.py       # Serveur MCP principal
+|       |-- tools.py        # 10 outils MCP
+|       +-- tools_v2.py     # Outils MCP v2
 |
 |-- scripts/                 # Automatisation
-|   |-- bootstrap.py        # Initialisation (9 etapes)
+|   |-- bootstrap.py        # Initialisation complete
 |   |-- update.py           # Mise a jour incrementale
 |   |-- maintenance.py      # VACUUM, ANALYZE, cleanup
-|   +-- transform-sonar.py  # Transformation issues Sonar
+|   |-- transform-sonar.py  # Transformation issues SonarCloud
+|   |-- fetch-sonar.py      # Recuperation issues SonarCloud
+|   |-- validate-web-report.py  # Validation rapport JSON
+|   |-- validate_issues.py  # Validation qualite issues
+|   +-- content_generator.py # Generation de contenu
+|
+|-- config/                  # Configuration YAML
+|   |-- agentdb.yaml        # Config AgentDB complete
+|   +-- sonar.yaml          # Config SonarCloud
 |
 |-- reports/                 # Rapports generes
 |   +-- {date}-{commit}/    # Un dossier par analyse
 |
-|-- config/                  # Configuration YAML
+|-- sonar/                   # Issues SonarCloud
+|   +-- issues.json         # Issues recuperees
+|
 |-- tests/                   # Suite de tests
 |-- logs/                    # Journaux et metriques
 |

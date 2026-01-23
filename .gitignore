@@ -1,24 +1,113 @@
+# =============================================================================
+# Python
+# =============================================================================
 *.pyc
-env
+*.pyo
+*.pyd
+__pycache__/
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Environment variables (credentials)
+# =============================================================================
+# Virtual Environments
+# =============================================================================
+env/
+venv/
+.venv/
+.venv-*/
+ENV/
+
+# =============================================================================
+# Environment Variables (credentials)
+# =============================================================================
 .env
 .env.local
 .env.*.local
 
+# =============================================================================
+# IDE / Editors
+# =============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# =============================================================================
+# OS Generated
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =============================================================================
+# AgentDB - SQLite databases
+# =============================================================================
 .claude/agentdb/db.sqlite
 .claude/agentdb/db.sqlite-shm
 .claude/agentdb/db.sqlite-wal
-
-.claude/logs/*
 .claude/agentdb/db.sqlite.bak
-.claude/logs/agentdb_queries.log
-.claude/logs/bootstrap.log
-
-.claude/reports/*
 .claude/agentdb/schema.sql
 
+# AgentDB data directory
+.claude/data/
+.claude/data/*.sqlite
+.claude/data/*.sqlite-shm
+.claude/data/*.sqlite-wal
+
+# =============================================================================
+# Logs
+# =============================================================================
+*.log
+.claude/logs/
+logs/
+
+# =============================================================================
+# Reports (generated)
+# =============================================================================
+.claude/reports/
+reports/
+
+# =============================================================================
+# Tests artifacts
+# =============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# =============================================================================
+# Project specific
+# =============================================================================
 cpp-analyzer
 
-reports/*
-.venv-docs/
+# Worktrees temporaires
+/tmp/cre-worktrees/
+
+# MkDocs build
+site/

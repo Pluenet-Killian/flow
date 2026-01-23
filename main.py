@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import Literal, Optional
 from datetime import datetime, timedelta, timezone
@@ -20,7 +20,7 @@ import json
 import websockets
 import yaml
 
-from claude import launch_claude_stream_json, log_to_stderr, WebSocketNotifier, WS_BASE_URL
+from claude import launch_claude_stream_json, log_to_stderr, WebSocketNotifier
 
 # Charger .env si présent (avant les autres imports qui utilisent les env vars)
 from dotenv import load_dotenv
@@ -387,6 +387,23 @@ class GitContext:
     detection_mode: str = "auto"  # "auto" ou "manual"
 
 
+def get_git_command(args: list[str]) -> list[str]:
+    """
+    Construit la commande git avec sshpass si GIT_SSH_PASSWORD est défini.
+
+    Args:
+        args: Liste des arguments git (sans 'git')
+
+    Returns:
+        Liste de commande complète (avec ou sans sshpass)
+    """
+    git_password = os.environ.get("GIT_SSH_PASSWORD")
+    if git_password:
+        # Utiliser sshpass pour les commandes qui nécessitent une authentification
+        return ["sshpass", "-p", git_password, "git"] + args
+    return ["git"] + args
+
+
 def run_git_command(args: list[str], timeout: int = 60, cwd: Path = None) -> tuple[bool, str]:
     """
     Exécute une commande git et retourne (success, output).
@@ -400,8 +417,9 @@ def run_git_command(args: list[str], timeout: int = 60, cwd: Path = None) -> tup
         Tuple (success: bool, output: str)
     """
     try:
+        cmd = get_git_command(args)
         result = subprocess.run(
-            ['git'] + args,
+            cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -640,7 +658,7 @@ def build_analysis_prompt(git_context: GitContext, request) -> str:
     Returns:
         Prompt complet pour Claude
     """
-    prompt_path = Path(".claude/commands/analyse_py2.md")
+    prompt_path = Path(".claude/commands/analyze_py.md")
     if not prompt_path.exists():
         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
 
@@ -744,13 +762,18 @@ app = FastAPI(
 # =============================================================================
 
 
-async def run_test_analysis(request: ClaudeRequest) -> None:
+async def run_test_analysis(request: ClaudeRequest, ws_base_url: str, http_base_url: str) -> None:
     """
     Mode test: envoie 1+1=2 puis un fichier JSON de test via WebSocket.
     Utilisé pour tester le protocole WebSocket sans lancer Claude.
+
+    Args:
+        request: La requête Claude
+        ws_base_url: URL de base WebSocket (ex: ws://192.168.1.1:8080)
+        http_base_url: URL de base HTTP (ex: http://192.168.1.1:8080)
     """
     job_id = request.jobId
-    ws_url = f"{WS_BASE_URL}/api/ws/jobs/{job_id}"
+    ws_url = f"{ws_base_url}/api/ws/jobs/{job_id}"
 
     log_to_stderr(f"[TEST MODE] Starting test analysis for job {job_id}\n")
 
@@ -771,7 +794,7 @@ async def run_test_analysis(request: ClaudeRequest) -> None:
                 log_to_stderr(f"[TEST MODE] WebSocket connected\n")
 
         async with websocket:
-            notifier = WebSocketNotifier(websocket)
+            notifier = WebSocketNotifier(websocket, http_base_url=http_base_url)
 
             # Démarrer l'action
             await notifier.action_started()
@@ -861,12 +884,17 @@ async def run_test_analysis(request: ClaudeRequest) -> None:
             jobs[job_id].completed_at = datetime.now()
 
 
-async def send_error_to_websocket(job_id: str, error_msg: str) -> None:
+async def send_error_to_websocket(job_id: str, error_msg: str, ws_base_url: str) -> None:
     """
     Envoie une erreur via WebSocket au client.
     Utilisé quand une erreur survient avant que launch_claude_stream_json soit appelé.
+
+    Args:
+        job_id: ID du job
+        error_msg: Message d'erreur
+        ws_base_url: URL de base WebSocket
     """
-    ws_url = f"{WS_BASE_URL}/api/ws/jobs"
+    ws_url = f"{ws_base_url}/api/ws/jobs"
     try:
         async with asyncio.timeout(30):
             ws = await websockets.connect(f"{ws_url}/{job_id}")
@@ -888,12 +916,17 @@ async def send_error_to_websocket(job_id: str, error_msg: str) -> None:
         log_to_stderr(f"[WS Error] Failed to send error via WebSocket: {e}\n")
 
 
-async def send_no_files_to_websocket(job_id: str, git_context: GitContext) -> None:
+async def send_no_files_to_websocket(job_id: str, git_context: GitContext, ws_base_url: str) -> None:
     """
     Notifie le WebSocket qu'il n'y a pas de fichiers à analyser.
     Envoie un action_complete avec succès mais sans rapport.
+
+    Args:
+        job_id: ID du job
+        git_context: Contexte git
+        ws_base_url: URL de base WebSocket
     """
-    ws_url = f"{WS_BASE_URL}/api/ws/jobs"
+    ws_url = f"{ws_base_url}/api/ws/jobs"
     try:
         async with asyncio.timeout(30):
             ws = await websockets.connect(f"{ws_url}/{job_id}")
@@ -924,7 +957,7 @@ async def send_no_files_to_websocket(job_id: str, git_context: GitContext) -> No
 # Tâches en arrière-plan
 # =============================================================================
 
-async def run_claude_analysis(request: ClaudeRequest) -> None:
+async def run_claude_analysis(request: ClaudeRequest, ws_base_url: str, http_base_url: str) -> None:
     """
     Exécute l'analyse Claude en arrière-plan (async).
     Met à jour le statut du job au fur et à mesure.
@@ -933,6 +966,11 @@ async def run_claude_analysis(request: ClaudeRequest) -> None:
     1. Créer un worktree isolé pour le commit
     2. Résoudre le contexte git (diff, fichiers modifiés)
     3. Lancer Claude dans le worktree
+
+    Args:
+        request: La requête Claude
+        ws_base_url: URL de base WebSocket (ex: ws://192.168.1.1:8080)
+        http_base_url: URL de base HTTP (ex: http://192.168.1.1:8080)
     """
     job_id = request.jobId
     worktree_mgr = WorktreeManager()
@@ -992,7 +1030,7 @@ async def run_claude_analysis(request: ClaudeRequest) -> None:
             log_to_stderr(f"[Job {job_id}] No code files to analyze\n")
 
             # Notifier le WebSocket que l'analyse est terminée (rien à faire)
-            await send_no_files_to_websocket(job_id, git_context)
+            await send_no_files_to_websocket(job_id, git_context, ws_base_url)
 
             if job_id in jobs:
                 jobs[job_id].status = JobStatus.COMPLETED
@@ -1013,7 +1051,9 @@ async def run_claude_analysis(request: ClaudeRequest) -> None:
             request=request,
             working_dir=working_dir,
             max_timeout=7200,
-            verbosity=1
+            verbosity=1,
+            ws_base_url=ws_base_url,
+            http_base_url=http_base_url
         )
 
         # Mettre à jour avec le résultat
@@ -1033,7 +1073,7 @@ async def run_claude_analysis(request: ClaudeRequest) -> None:
         log_to_stderr(f"[Job {job_id}] Error: {error_msg}\n")
 
         # Envoyer l'erreur via WebSocket (pour les erreurs qui surviennent avant launch_claude_stream_json)
-        await send_error_to_websocket(job_id, error_msg)
+        await send_error_to_websocket(job_id, error_msg, ws_base_url)
 
         if job_id in jobs:
             jobs[job_id].status = JobStatus.FAILED
@@ -1052,7 +1092,7 @@ def read_root():
 
 
 @app.post("/trigger")
-async def launch_claude(request: ClaudeRequest):
+async def launch_claude(request: ClaudeRequest, http_request: Request):
     """
     Déclenche une analyse Claude en arrière-plan.
 
@@ -1065,6 +1105,31 @@ async def launch_claude(request: ClaudeRequest):
             status_code=400,
             detail=f"Unsupported action: {request.action}. Only 'issue_detector' is supported."
         )
+
+    # Déduire l'URL du serveur WebSocket depuis la requête entrante
+    # Priorité: header X-Forwarded-Host > header Host > client host
+    forwarded_host = http_request.headers.get("x-forwarded-host")
+    host_header = http_request.headers.get("host")
+
+    if forwarded_host:
+        # Derrière un proxy (ex: nginx)
+        request_host = forwarded_host.split(",")[0].strip()
+    elif host_header:
+        request_host = host_header
+    else:
+        # Fallback: utiliser l'IP du client (peu probable)
+        request_host = f"{http_request.client.host}:8080"
+
+    # Construire les URLs WS et HTTP
+    # Note: on garde le port 8080 car c'est le port du serveur CRE_INTERFACE
+    # Si le host contient déjà un port, on l'utilise tel quel
+    if ":" not in request_host:
+        request_host = f"{request_host}:8080"
+
+    ws_base_url = f"ws://{request_host}"
+    http_base_url = f"http://{request_host}"
+
+    log_to_stderr(f"Deduced WebSocket URL from request: {ws_base_url}\n")
 
     # Vérifier si le job existe déjà
     if request.jobId in jobs:
@@ -1096,12 +1161,12 @@ async def launch_claude(request: ClaudeRequest):
     if TEST_MODE:
         # Mode test: envoie 1+1=2 puis un JSON de test
         log_to_stderr("[TEST MODE] Using test analysis instead of Claude\n")
-        task = asyncio.create_task(run_test_analysis(request))
+        task = asyncio.create_task(run_test_analysis(request, ws_base_url, http_base_url))
         running_tasks.add(task)
         task.add_done_callback(running_tasks.discard)
     else:
         # Action 'issue_detector' (déjà validée au début de la fonction)
-        task = asyncio.create_task(run_claude_analysis(request))
+        task = asyncio.create_task(run_claude_analysis(request, ws_base_url, http_base_url))
         running_tasks.add(task)
         task.add_done_callback(running_tasks.discard)  # Nettoie quand terminé
 

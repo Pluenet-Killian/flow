@@ -86,7 +86,7 @@ project:
 
 ```yaml
 database:
-  path: ".claude/agentdb/db.sqlite"
+  path: ".claude/data/db.sqlite"
   wal_mode: true
   timeout: 30
   cache_size: 10000
@@ -94,7 +94,7 @@ database:
 
 | Parametre | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `path` | path | `.claude/agentdb/db.sqlite` | Chemin vers la base SQLite |
+| `path` | path | `.claude/data/db.sqlite` | Chemin vers la base SQLite |
 | `wal_mode` | bool | `true` | Active le mode WAL (Write-Ahead Logging) |
 | `timeout` | int | `30` | Timeout des requetes en secondes |
 | `cache_size` | int | `10000` | Taille du cache en pages (1 page = 4KB) |
@@ -443,6 +443,46 @@ logging:
 | `name` | Nom du logger |
 | `levelname` | Niveau (DEBUG, INFO, WARNING, ERROR) |
 | `message` | Message |
+
+---
+
+## Section : Analysis (Configuration des Agents)
+
+Cette section configure les seuils de verdict et les penalites pour chaque agent.
+
+```yaml
+analysis:
+  verdicts:
+    approve: 80      # Score >= 80 : peut etre merge
+    review: 60       # Score >= 60 : review humaine recommandee
+    careful: 40      # Score >= 40 : review approfondie requise
+    reject: 0        # Score < 40 : ne pas merger
+
+  weights:
+    security: 0.35   # Priorite maximale a la securite
+    risk: 0.25       # Risque global
+    reviewer: 0.25   # Qualite du code
+    analyzer: 0.15   # Impact (informatif)
+```
+
+### Formule du Score Global
+
+```
+Score = Security × 0.35 + Risk × 0.25 + Reviewer × 0.25 + Analyzer × 0.15
+```
+
+### Penalites par Agent
+
+| Agent | Facteur | Penalite Max | Description |
+|-------|---------|--------------|-------------|
+| security | critical | -30 | Vulnerabilite CRITICAL |
+| security | high | -20 | Vulnerabilite HIGH |
+| security | regression | -25 | Regression detectee |
+| reviewer | error | -15 | Issue de type ERROR |
+| reviewer | warning | -8 | Issue de type WARNING |
+| risk | criticality | -30 | Fichier critique touche |
+| risk | no_tests | -10 | Pas de tests |
+| analyzer | global_impact | -20 | Impact GLOBAL (cross-module) |
 
 ---
 

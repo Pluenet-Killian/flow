@@ -438,33 +438,33 @@ python .claude/scripts/update.py
 
 ```bash
 # 1. Vacuum de la base (recuperer l'espace)
-sqlite3 .claude/agentdb/db.sqlite "VACUUM;"
+sqlite3 .claude/data/db.sqlite "VACUUM;"
 
 # 2. Verification d'integrite
-sqlite3 .claude/agentdb/db.sqlite "PRAGMA integrity_check;"
+sqlite3 .claude/data/db.sqlite "PRAGMA integrity_check;"
 
 # 3. Mise a jour des statistiques SQLite
-sqlite3 .claude/agentdb/db.sqlite "ANALYZE;"
+sqlite3 .claude/data/db.sqlite "ANALYZE;"
 ```
 
 ### Maintenance Mensuelle
 
 ```bash
 # 1. Nettoyage des vieux snapshots
-sqlite3 .claude/agentdb/db.sqlite "
+sqlite3 .claude/data/db.sqlite "
   DELETE FROM snapshot_symbols
   WHERE created_at < datetime('now', '-30 days');
 "
 
 # 2. Nettoyage des vieux runs
-sqlite3 .claude/agentdb/db.sqlite "
+sqlite3 .claude/data/db.sqlite "
   DELETE FROM pipeline_runs
   WHERE started_at < datetime('now', '-90 days')
   AND id NOT IN (SELECT id FROM pipeline_runs ORDER BY started_at DESC LIMIT 100);
 "
 
 # 3. Verification des foreign keys
-sqlite3 .claude/agentdb/db.sqlite "PRAGMA foreign_key_check;"
+sqlite3 .claude/data/db.sqlite "PRAGMA foreign_key_check;"
 
 # 4. Rotation des logs
 ls -la .claude/logs/
@@ -543,7 +543,7 @@ WHERE file_module = 'drivers' LIMIT 100;
 ```bash
 # Backup avec timestamp
 BACKUP_FILE="agentdb_$(date +%Y%m%d_%H%M%S).sqlite"
-sqlite3 .claude/agentdb/db.sqlite ".backup $BACKUP_FILE"
+sqlite3 .claude/data/db.sqlite ".backup $BACKUP_FILE"
 
 # Compresser
 gzip $BACKUP_FILE
@@ -556,17 +556,17 @@ gzip $BACKUP_FILE
 gunzip agentdb_20240115_120000.sqlite.gz
 
 # Restaurer
-cp agentdb_20240115_120000.sqlite .claude/agentdb/db.sqlite
+cp agentdb_20240115_120000.sqlite .claude/data/db.sqlite
 ```
 
 ### Verification Post-Restauration
 
 ```bash
 # Verifier l'integrite
-sqlite3 .claude/agentdb/db.sqlite "PRAGMA integrity_check;"
+sqlite3 .claude/data/db.sqlite "PRAGMA integrity_check;"
 
 # Verifier la version du schema
-sqlite3 .claude/agentdb/db.sqlite "
+sqlite3 .claude/data/db.sqlite "
   SELECT value FROM agentdb_meta WHERE key = 'schema_version';
 "
 ```
@@ -581,9 +581,9 @@ sqlite3 .claude/agentdb/db.sqlite "
 # Symptome : PRAGMA integrity_check retourne des erreurs
 
 # Solution : Reconstruire
-sqlite3 .claude/agentdb/db.sqlite ".dump" > backup.sql
-rm .claude/agentdb/db.sqlite
-sqlite3 .claude/agentdb/db.sqlite < backup.sql
+sqlite3 .claude/data/db.sqlite ".dump" > backup.sql
+rm .claude/data/db.sqlite
+sqlite3 .claude/data/db.sqlite < backup.sql
 ```
 
 ### Probleme : Index Desynchronise
@@ -606,13 +606,13 @@ indexer.reindex_file('src/problematic_file.c')
 
 ```bash
 # Diagnostiquer
-sqlite3 .claude/agentdb/db.sqlite "
+sqlite3 .claude/data/db.sqlite "
   EXPLAIN QUERY PLAN
   SELECT * FROM symbols WHERE name LIKE 'lcd%';
 "
 
 # Solution : Reconstruire les index
-sqlite3 .claude/agentdb/db.sqlite "REINDEX;"
+sqlite3 .claude/data/db.sqlite "REINDEX;"
 ```
 
 ---

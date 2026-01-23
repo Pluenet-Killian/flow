@@ -23,9 +23,9 @@ import websockets
 # =============================================================================
 
 # URL du serveur WebSocket CRE_INTERFACE (configurable via env)
-WS_BASE_URL = os.environ.get("CRE_WS_URL", "ws://192.36.128.62:8080")
+WS_BASE_URL = os.environ.get("CRE_WS_URL", "ws://192.36.128.68:8080")
 # URL HTTP pour l'upload des artifacts
-HTTP_BASE_URL = os.environ.get("CRE_HTTP_URL", "http://192.36.128.62:8080")
+HTTP_BASE_URL = os.environ.get("CRE_HTTP_URL", "http://192.36.128.68:8080")
 
 
 # =============================================================================
@@ -91,10 +91,11 @@ class WebSocketNotifier:
         "web-synthesizer": "phase4_web_synthesizer",
     }
 
-    def __init__(self, websocket, ws_url: str = None, job_id: str = None):
+    def __init__(self, websocket, ws_url: str = None, job_id: str = None, http_base_url: str = None):
         self.ws = websocket
         self.ws_url = ws_url      # URL pour reconnexion
         self.job_id = job_id      # Job ID pour reconnexion
+        self.http_base_url = http_base_url or HTTP_BASE_URL  # URL HTTP pour upload artifacts
         self.current_step: Optional[str] = None
         self.action_status: str = "success"
         self.action_completed: bool = False
@@ -396,7 +397,7 @@ class WebSocketNotifier:
                 return False
 
             # 3. Upload HTTP du fichier (multipart/form-data)
-            full_url = f"{HTTP_BASE_URL}{upload_url}"
+            full_url = f"{self.http_base_url}{upload_url}"
 
             async with aiohttp.ClientSession() as session:
                 with open(path, 'rb') as f:
@@ -815,7 +816,8 @@ async def launch_claude_stream_json(
     working_dir: Path,
     max_timeout: int = 7200,
     verbosity: int = 1,
-    ws_url: str = None
+    ws_base_url: str = None,
+    http_base_url: str = None
 ) -> dict:
     """
     Lance Claude en mode stream-json avec architecture async native.
@@ -826,14 +828,19 @@ async def launch_claude_stream_json(
         working_dir: Répertoire de travail (worktree) pour Claude
         max_timeout: Timeout maximum en secondes (défaut: 2 heures)
         verbosity: Niveau de verbosité (0=minimal, 1=normal, 2=debug)
-        ws_url: URL du serveur WebSocket (optionnel, utilise CRE_WS_URL env par défaut)
+        ws_base_url: URL de base WebSocket (optionnel, utilise CRE_WS_URL env par défaut)
+        http_base_url: URL de base HTTP pour upload artifacts (optionnel)
 
     Returns:
         dict avec 'success', 'result', 'cost', 'messages'
     """
-    # Utiliser la configuration si ws_url non spécifié
-    if ws_url is None:
-        ws_url = f"{WS_BASE_URL}/api/ws/jobs"
+    # Utiliser la configuration si non spécifié
+    if ws_base_url is None:
+        ws_base_url = WS_BASE_URL
+    if http_base_url is None:
+        http_base_url = HTTP_BASE_URL
+
+    ws_url = f"{ws_base_url}/api/ws/jobs"
 
     cmd = [
         "claude",
@@ -864,7 +871,7 @@ async def launch_claude_stream_json(
 
         async with websocket:
             # Créer le notifier avec les infos pour reconnexion
-            notifier = WebSocketNotifier(websocket, ws_url=ws_url, job_id=request.jobId)
+            notifier = WebSocketNotifier(websocket, ws_url=ws_url, job_id=request.jobId, http_base_url=http_base_url)
             processor = ClaudeEventProcessor(notifier, verbosity, working_dir)
 
             try:

@@ -41,6 +41,23 @@ WORKTREE_TTL = int(os.environ.get("CRE_WORKTREE_TTL", 3600 * 24))  # 24h par dé
 MAIN_REPO = Path(__file__).parent.parent  # /home/.../flow
 
 
+def get_git_command(args: list[str]) -> list[str]:
+    """
+    Construit la commande git avec sshpass si GIT_SSH_PASSWORD est défini.
+
+    Args:
+        args: Liste des arguments git (sans 'git')
+
+    Returns:
+        Liste de commande complète (avec ou sans sshpass)
+    """
+    git_password = os.environ.get("GIT_SSH_PASSWORD")
+    if git_password:
+        # Utiliser sshpass pour les commandes qui nécessitent une authentification
+        return ["sshpass", "-p", git_password, "git"] + args
+    return ["git"] + args
+
+
 # =============================================================================
 # WorktreeManager
 # =============================================================================
@@ -133,7 +150,7 @@ class WorktreeManager:
                 # Commit non trouvé localement, tenter un fetch
                 log_to_stderr(f"[Worktree] Commit {commit_sha[:12]} non trouvé localement, fetch en cours...\n")
                 fetch_result = subprocess.run(
-                    ["git", "fetch", "--all"],
+                    get_git_command(["fetch", "--all"]),
                     cwd=self.main_repo,
                     capture_output=True,
                     text=True,
